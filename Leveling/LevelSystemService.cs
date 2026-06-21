@@ -1,4 +1,4 @@
-using DiscordXpBot.Data;
+using DiscordXpBot.Persistence;
 
 namespace DiscordXpBot.Leveling;
 

@@ -1,5 +1,5 @@
 using DiscordXpBot.Configuration;
-using DiscordXpBot.Data;
+using DiscordXpBot.Persistence;
 using DiscordXpBot.Services;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;

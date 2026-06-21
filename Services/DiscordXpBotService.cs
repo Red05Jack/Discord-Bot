@@ -5,7 +5,7 @@ using Discord.Net;
 using Discord.Rest;
 using Discord.WebSocket;
 using DiscordXpBot.Configuration;
-using DiscordXpBot.Data;
+using DiscordXpBot.Persistence;
 using DiscordXpBot.Leveling;
 
 namespace DiscordXpBot.Services;

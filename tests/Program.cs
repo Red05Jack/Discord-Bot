@@ -1,4 +1,4 @@
-using DiscordXpBot.Data;
+using DiscordXpBot.Persistence;
 using DiscordXpBot.Leveling;
 using DiscordXpBot.Services;
 using Microsoft.Data.Sqlite;
