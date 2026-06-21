@@ -12,6 +12,7 @@ public sealed class BotOptions
     public XpOptions Xp { get; set; } = new();
     public CommandOptions Commands { get; set; } = new();
     public BotChannelOptions BotChannel { get; set; } = new();
+    public DatabaseChannelOptions DatabaseChannel { get; set; } = new();
     public AnnouncementOptions Announcements { get; set; } = new();
     public DebugOptions Debug { get; set; } = new();
 
@@ -34,6 +35,7 @@ public sealed class BotOptions
         }) ?? throw new InvalidOperationException("Die Konfiguration konnte nicht gelesen werden.");
         options.Commands ??= new CommandOptions();
         options.Commands.BotMasterRoleIds ??= [];
+        options.DatabaseChannel ??= new DatabaseChannelOptions();
 
         var tokenFromEnvironment = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN");
         if (!string.IsNullOrWhiteSpace(tokenFromEnvironment))
@@ -119,6 +121,20 @@ public sealed class BotOptions
                 throw new InvalidOperationException(
                     "BotChannel.ChannelName muss gesetzt sein, wenn keine ChannelId angegeben ist.");
             }
+        }
+
+        if (DatabaseChannel.Enabled &&
+            DatabaseChannel.ChannelId == 0 &&
+            string.IsNullOrWhiteSpace(DatabaseChannel.ChannelName))
+        {
+            throw new InvalidOperationException(
+                "DatabaseChannel.ChannelName muss gesetzt sein, wenn keine ChannelId angegeben ist.");
+        }
+
+        if (DatabaseChannel.SyncDelaySeconds <= 0)
+        {
+            throw new InvalidOperationException(
+                "DatabaseChannel.SyncDelaySeconds muss größer als 0 sein.");
         }
 
         if (Levels.Enabled &&
@@ -213,6 +229,16 @@ public sealed class BotChannelOptions
     public string ChannelName { get; set; } = "mee6-xp-befehle";
     public ulong CategoryId { get; set; }
     public bool CreateChannelIfMissing { get; set; } = true;
+}
+
+public sealed class DatabaseChannelOptions
+{
+    public bool Enabled { get; set; } = true;
+    public ulong ChannelId { get; set; }
+    public string ChannelName { get; set; } = "bot-db";
+    public ulong CategoryId { get; set; }
+    public bool CreateChannelIfMissing { get; set; } = true;
+    public int SyncDelaySeconds { get; set; } = 3;
 }
 
 public sealed class AnnouncementOptions

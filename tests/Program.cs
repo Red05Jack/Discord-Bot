@@ -11,6 +11,9 @@ var databasePath = Path.Combine(
 var legacyDatabasePath = Path.Combine(
     Path.GetTempPath(),
     $"discord-xp-bot-legacy-selftest-{Guid.NewGuid():N}.db");
+var snapshotDatabasePath = Path.Combine(
+    Path.GetTempPath(),
+    $"discord-xp-bot-snapshot-selftest-{Guid.NewGuid():N}.db");
 
 try
 {
@@ -34,6 +37,13 @@ try
             entry.CurrentLevel == 0 &&
             entry.CurrentLevelProgress == 0) == 2,
         "Neue Benutzer wurden nicht mit Level 0 und 0 XP angelegt.");
+    Assert(
+        await database.GetRankColorAsync(guildId, 901) == "#FFFFFF",
+        "Die Standardfarbe einer Rank-Karte ist nicht #FFFFFF.");
+    await database.SetRankColorAsync(guildId, 901, "#12ABEF");
+    Assert(
+        await database.GetRankColorAsync(guildId, 901) == "#12ABEF",
+        "Die persönliche Rank-Kartenfarbe wurde nicht gespeichert.");
 
     const ulong deterministicMessageId = 123456789012345678;
     var deterministicXp = MessageXpCalculator.Calculate(deterministicMessageId, 15, 25);
@@ -58,7 +68,13 @@ try
         (int)Math.Round(20.0 * Math.Pow(2, 1.9), MidpointRounding.ToEven),
         "Die Level-Kurve entspricht nicht 20 * (level + 1)^1.9.");
     await using (var rankCard = new RankCardRenderer().Render(
-                     new RankCardData("Rank Test", 3, 12, 345, 1000),
+                     new RankCardData(
+                         "Rank Test",
+                         3,
+                         12,
+                         345,
+                         1000,
+                         "#12ABEF"),
                      avatarStream: null))
     {
         var signature = new byte[8];
@@ -75,6 +91,41 @@ try
     Assert(
         multiLevelState.Level == 2 && multiLevelState.CurrentLevelProgress == 5,
         "Mehrere Level-Ups aus einer XP-Summe wurden nicht korrekt berechnet.");
+
+    var snapshotDatabase = new BotDatabase(snapshotDatabasePath);
+    await snapshotDatabase.InitializeAsync();
+    await snapshotDatabase.EnsureUserAccountsAsync(guildId, [777]);
+    var restoreResult = await snapshotDatabase.RestorePersistentUserProfilesAsync(
+        guildId,
+        [
+            new PersistentUserProfile(
+                777,
+                MessageXp: 120,
+                VoiceXp: 50,
+                InviteXp: 800,
+                RankColor: "#ABCDEF")
+        ],
+        now);
+    Assert(
+        restoreResult.XpRestoreApplied &&
+        restoreResult.RestoredXpUsers == 1 &&
+        restoreResult.RestoredColors == 1,
+        "Der Discord-JSON-Snapshot wurde nicht in eine leere Datenbank importiert.");
+    var restoredAccount = await snapshotDatabase.GetInternalXpAccountAsync(guildId, 777);
+    Assert(
+        restoredAccount.TotalXp == 970 &&
+        restoredAccount.MessageXp == 120 &&
+        restoredAccount.VoiceXp == 50 &&
+        restoredAccount.InviteXp == 800 &&
+        await snapshotDatabase.GetRankColorAsync(guildId, 777) == "#ABCDEF",
+        "XP oder Farbe aus dem Discord-JSON-Snapshot wurden falsch wiederhergestellt.");
+    var reopenedSnapshotDatabase = new BotDatabase(snapshotDatabasePath);
+    await reopenedSnapshotDatabase.InitializeAsync();
+    var accountAfterRestart =
+        await reopenedSnapshotDatabase.GetInternalXpAccountAsync(guildId, 777);
+    Assert(
+        accountAfterRestart.TotalXp == 970,
+        "Die aus Discord wiederhergestellten XP überleben keinen Bot-Neustart.");
 
     var invite = new InviteRewardRecord(
         Guid.NewGuid().ToString("N"),
@@ -570,6 +621,11 @@ finally
     if (File.Exists(legacyDatabasePath))
     {
         File.Delete(legacyDatabasePath);
+    }
+
+    if (File.Exists(snapshotDatabasePath))
+    {
+        File.Delete(snapshotDatabasePath);
     }
 }
 

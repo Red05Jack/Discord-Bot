@@ -98,6 +98,25 @@ Bot-Master können zusätzlich interne Werte prüfen:
 Der Debug-Modus zeigt Gesamt-, Nachrichten-, Voice- und Invite-XP sowie die gespeicherte
 Nachrichtenanzahl.
 
+### Rank-Kartenfarbe
+
+Jedes Mitglied kann die helle Akzentfarbe seiner Rank-Karte selbst setzen:
+
+```text
+!set-rank-color #FFFFFF
+```
+
+Erlaubt sind sechsstellige Hex-Farben. Der Standardwert ist `#FFFFFF`.
+
+### `!help`
+
+```text
+!help
+```
+
+Der Bot erkennt anhand der Discord-Rollen, ob der Aufrufer Bot-Master ist, und zeigt nur
+die Befehle an, die dieser Benutzer tatsächlich verwenden darf.
+
 ## Voice-XP
 
 Voice-Zeit wird in vollständigen Blöcken vergütet. Standardmäßig gilt:
@@ -171,6 +190,22 @@ Weitere unterstützte Umgebungsvariablen:
 Der Bot-Ausgabekanal wird über `BotChannel.ChannelId` oder `BotChannel.ChannelName`
 ausgewählt. Mit `BotChannel.CreateChannelIfMissing: true` wird er bei Bedarf erstellt.
 
+XP und Rank-Kartenfarben werden zusätzlich als JSON-Snapshot im Textkanal `bot-db`
+gesichert. Kleine Snapshots stehen direkt in einer JSON-Codebox; größere Snapshots werden
+als `bot-db.json` an genau eine Bot-Nachricht angehängt. Ist die lokale SQLite-Datenbank
+leer, stellt der Bot diese Werte beim Start aus dem Discord-Snapshot wieder her.
+
+```json
+"DatabaseChannel": {
+  "Enabled": true,
+  "ChannelId": 0,
+  "ChannelName": "bot-db",
+  "CategoryId": 0,
+  "CreateChannelIfMissing": true,
+  "SyncDelaySeconds": 3
+}
+```
+
 Bot-Master-Rollen werden als erweiterbare Liste konfiguriert:
 
 ```json
@@ -198,10 +233,15 @@ Lokaler Selbsttest:
 dotnet run --project tests/DiscordXpBot.SelfTest.csproj
 ```
 
+Die Rank-Karten werden mit SkiaSharp gerendert. Dadurch ist unter Linux keine
+`gdiplus.dll` beziehungsweise kein `libgdiplus` mehr erforderlich.
+
 ## Befehle
 
+- `!help` – zeigt die für den Aufrufer verfügbaren Befehle
 - `!myrank` – sendet die eigene Rank-Karte als Bild
 - `!myrank @user` – sendet die Rank-Karte eines Servermitglieds
+- `!set-rank-color #FFFFFF` – setzt die persönliche Akzentfarbe
 - `!myrank @user debug` – zeigt Master-Rollen die internen XP-Werte
 - `!recalculate all` – berechnet Nachrichten und Invite-Zuordnungen neu
 - `!recalculate messages` – berechnet ausschließlich Nachrichten neu

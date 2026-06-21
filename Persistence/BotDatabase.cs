@@ -52,6 +52,22 @@ public sealed class BotDatabase
                     PRIMARY KEY (guild_id, user_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    rank_color TEXT NOT NULL DEFAULT '#FFFFFF',
+                    PRIMARY KEY (guild_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS xp_snapshot_baselines (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    message_xp INTEGER NOT NULL DEFAULT 0,
+                    voice_xp INTEGER NOT NULL DEFAULT 0,
+                    invite_xp INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (guild_id, user_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS internal_xp_ledger (
                     id TEXT PRIMARY KEY,
                     guild_id TEXT NOT NULL,
@@ -939,6 +955,230 @@ public sealed class BotDatabase
         }
     }
 
+    public async Task<string> GetRankColorAsync(ulong guildId, ulong userId)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            await using var connection = await OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                """
+                SELECT rank_color
+                FROM user_preferences
+                WHERE guild_id = $guildId AND user_id = $userId;
+                """;
+            AddParameter(command, "$guildId", Id(guildId));
+            AddParameter(command, "$userId", Id(userId));
+            return await command.ExecuteScalarAsync() as string ?? "#FFFFFF";
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task SetRankColorAsync(
+        ulong guildId,
+        ulong userId,
+        string rankColor)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            await using var connection = await OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                """
+                INSERT INTO user_preferences (guild_id, user_id, rank_color)
+                VALUES ($guildId, $userId, $rankColor)
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                    rank_color = excluded.rank_color;
+                """;
+            AddParameter(command, "$guildId", Id(guildId));
+            AddParameter(command, "$userId", Id(userId));
+            AddParameter(command, "$rankColor", rankColor);
+            await command.ExecuteNonQueryAsync();
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<PersistentUserProfile>>
+        GetPersistentUserProfilesAsync(ulong guildId)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            var profiles = new List<PersistentUserProfile>();
+            await using var connection = await OpenConnectionAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                """
+                SELECT
+                    accounts.user_id,
+                    accounts.message_xp,
+                    accounts.voice_xp,
+                    accounts.invite_xp,
+                    COALESCE(preferences.rank_color, '#FFFFFF')
+                FROM internal_xp_accounts AS accounts
+                LEFT JOIN user_preferences AS preferences
+                    ON preferences.guild_id = accounts.guild_id
+                   AND preferences.user_id = accounts.user_id
+                WHERE accounts.guild_id = $guildId
+                ORDER BY accounts.user_id;
+                """;
+            AddParameter(command, "$guildId", Id(guildId));
+            await using var reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                profiles.Add(new PersistentUserProfile(
+                    ulong.Parse(reader.GetString(0), CultureInfo.InvariantCulture),
+                    reader.GetInt64(1),
+                    reader.GetInt64(2),
+                    reader.GetInt64(3),
+                    reader.GetString(4)));
+            }
+
+            return profiles;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<PersistentRestoreResult> RestorePersistentUserProfilesAsync(
+        ulong guildId,
+        IReadOnlyCollection<PersistentUserProfile> profiles,
+        DateTimeOffset timestamp)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            await using var connection = await OpenConnectionAsync();
+            using var transaction = connection.BeginTransaction();
+            var canRestoreXp = await HasNoStoredXpAsync(
+                connection,
+                transaction,
+                guildId);
+            var restoredXpUsers = 0;
+            var restoredColors = 0;
+
+            foreach (var profile in profiles
+                         .GroupBy(profile => profile.UserId)
+                         .Select(group => group.Last()))
+            {
+                await using (var preference = connection.CreateCommand())
+                {
+                    preference.Transaction = transaction;
+                    preference.CommandText =
+                        """
+                        INSERT INTO user_preferences (guild_id, user_id, rank_color)
+                        VALUES ($guildId, $userId, $rankColor)
+                        ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                            rank_color = excluded.rank_color;
+                        """;
+                    AddParameter(preference, "$guildId", Id(guildId));
+                    AddParameter(preference, "$userId", Id(profile.UserId));
+                    AddParameter(
+                        preference,
+                        "$rankColor",
+                        NormalizeStoredRankColor(profile.RankColor));
+                    await preference.ExecuteNonQueryAsync();
+                    restoredColors++;
+                }
+
+                if (!canRestoreXp)
+                {
+                    continue;
+                }
+
+                var totals = new XpSourceTotals(
+                    Math.Max(0, profile.MessageXp),
+                    Math.Max(0, profile.VoiceXp),
+                    Math.Max(0, profile.InviteXp));
+                await using (var baseline = connection.CreateCommand())
+                {
+                    baseline.Transaction = transaction;
+                    baseline.CommandText =
+                        """
+                        INSERT INTO xp_snapshot_baselines (
+                            guild_id, user_id, message_xp, voice_xp, invite_xp
+                        )
+                        VALUES (
+                            $guildId, $userId, $messageXp, $voiceXp, $inviteXp
+                        )
+                        ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                            message_xp = excluded.message_xp,
+                            voice_xp = excluded.voice_xp,
+                            invite_xp = excluded.invite_xp;
+                        """;
+                    AddParameter(baseline, "$guildId", Id(guildId));
+                    AddParameter(baseline, "$userId", Id(profile.UserId));
+                    AddParameter(baseline, "$messageXp", totals.MessageXp);
+                    AddParameter(baseline, "$voiceXp", totals.VoiceXp);
+                    AddParameter(baseline, "$inviteXp", totals.InviteXp);
+                    await baseline.ExecuteNonQueryAsync();
+                }
+
+                var cumulativeXp = 0L;
+                foreach (var source in new[]
+                         {
+                             (Amount: totals.MessageXp, Reason: "message-snapshot"),
+                             (Amount: totals.VoiceXp, Reason: "voice-snapshot"),
+                             (Amount: totals.InviteXp, Reason: "invite-snapshot")
+                         })
+                {
+                    if (source.Amount <= 0)
+                    {
+                        continue;
+                    }
+
+                    var oldState =
+                        LevelCalculator.CalculateLevelFromTotalXp(cumulativeXp);
+                    cumulativeXp += source.Amount;
+                    var newState =
+                        LevelCalculator.CalculateLevelFromTotalXp(cumulativeXp);
+                    await InsertXpMovementLogAsync(
+                        connection,
+                        transaction,
+                        guildId,
+                        profile.UserId,
+                        checked((int)source.Amount),
+                        source.Reason,
+                        $"discord-db:{guildId}:{profile.UserId}:{source.Reason}",
+                        timestamp,
+                        oldState,
+                        newState);
+                }
+
+                var finalState =
+                    LevelCalculator.CalculateLevelFromTotalXp(totals.TotalXp);
+                await UpsertXpAccountAsync(
+                    connection,
+                    transaction,
+                    guildId,
+                    profile.UserId,
+                    totals,
+                    finalState);
+                restoredXpUsers++;
+            }
+
+            transaction.Commit();
+            return new PersistentRestoreResult(
+                canRestoreXp,
+                restoredXpUsers,
+                restoredColors);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public async Task<XpMovementResult> RemoveXpAsync(
         ulong guildId,
         ulong userId,
@@ -1144,6 +1384,19 @@ public sealed class BotDatabase
                 delete.CommandText = "DELETE FROM message_xp WHERE guild_id = $guildId;";
                 AddParameter(delete, "$guildId", Id(guildId));
                 await delete.ExecuteNonQueryAsync();
+            }
+
+            await using (var clearSnapshotBaseline = connection.CreateCommand())
+            {
+                clearSnapshotBaseline.Transaction = transaction;
+                clearSnapshotBaseline.CommandText =
+                    """
+                    UPDATE xp_snapshot_baselines
+                    SET message_xp = 0
+                    WHERE guild_id = $guildId;
+                    """;
+                AddParameter(clearSnapshotBaseline, "$guildId", Id(guildId));
+                await clearSnapshotBaseline.ExecuteNonQueryAsync();
             }
 
             foreach (var message in messages)
@@ -1757,6 +2010,25 @@ public sealed class BotDatabase
             }
         }
 
+        await using (var selectBaselines = connection.CreateCommand())
+        {
+            selectBaselines.CommandText =
+                """
+                SELECT guild_id, user_id, message_xp
+                FROM xp_snapshot_baselines
+                WHERE message_xp != 0;
+                """;
+            await using var reader = await selectBaselines.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                var key = (
+                    ulong.Parse(reader.GetString(0), CultureInfo.InvariantCulture),
+                    ulong.Parse(reader.GetString(1), CultureInfo.InvariantCulture));
+                messageXpByUser[key] =
+                    messageXpByUser.GetValueOrDefault(key) + reader.GetInt64(2);
+            }
+        }
+
         var keys = accounts.Keys
             .Union(messageXpByUser.Keys)
             .Distinct()
@@ -2002,6 +2274,44 @@ public sealed class BotDatabase
         return await command.ExecuteScalarAsync() is not null;
     }
 
+    private static async Task<bool> HasNoStoredXpAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ulong guildId)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            """
+            SELECT
+                (SELECT COUNT(*)
+                 FROM internal_xp_ledger
+                 WHERE guild_id = $guildId),
+                COALESCE((
+                    SELECT SUM(total_xp)
+                    FROM internal_xp_accounts
+                    WHERE guild_id = $guildId
+                ), 0);
+            """;
+        AddParameter(command, "$guildId", Id(guildId));
+        await using var reader = await command.ExecuteReaderAsync();
+        await reader.ReadAsync();
+        return reader.GetInt64(0) == 0 && reader.GetInt64(1) == 0;
+    }
+
+    private static string NormalizeStoredRankColor(string? rankColor)
+    {
+        if (string.IsNullOrWhiteSpace(rankColor) ||
+            rankColor.Length != 7 ||
+            rankColor[0] != '#' ||
+            !rankColor.AsSpan(1).ToString().All(Uri.IsHexDigit))
+        {
+            return "#FFFFFF";
+        }
+
+        return rankColor.ToUpperInvariant();
+    }
+
     private static async Task<bool> ColumnExistsAsync(
         SqliteConnection connection,
         string tableName,
@@ -2199,6 +2509,21 @@ public sealed record InternalXpEntry(
     long VoiceXp,
     long InviteXp,
     long MessageCount);
+
+public sealed record PersistentUserProfile(
+    ulong UserId,
+    long MessageXp,
+    long VoiceXp,
+    long InviteXp,
+    string RankColor)
+{
+    public long TotalXp => MessageXp + VoiceXp + InviteXp;
+}
+
+public sealed record PersistentRestoreResult(
+    bool XpRestoreApplied,
+    int RestoredXpUsers,
+    int RestoredColors);
 
 public sealed record XpMovementResult(
     bool Applied,

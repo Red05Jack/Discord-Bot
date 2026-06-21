@@ -1,7 +1,4 @@
-using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
-using System.Drawing.Text;
+using SkiaSharp;
 
 namespace DiscordXpBot.Services;
 
@@ -9,45 +6,75 @@ public sealed class RankCardRenderer
 {
     private const int Width = 1090;
     private const int Height = 250;
-    private static readonly Color Accent = Color.FromArgb(99, 255, 243);
-    private static readonly Color TextColor = Color.FromArgb(246, 246, 248);
-    private static readonly Color MutedTextColor = Color.FromArgb(140, 255, 255, 255);
+    private static readonly SKColor TextColor = new(246, 246, 248);
+    private static readonly SKColor MutedTextColor = new(255, 255, 255, 140);
+    private static readonly SKTypeface NormalTypeface =
+        SKTypeface.FromFamilyName("DejaVu Sans", SKFontStyle.Normal) ??
+        SKTypeface.FromFamilyName("Arial", SKFontStyle.Normal) ??
+        SKTypeface.Default;
+    private static readonly SKTypeface BoldTypeface =
+        SKTypeface.FromFamilyName("DejaVu Sans", SKFontStyle.Bold) ??
+        SKTypeface.FromFamilyName("Arial", SKFontStyle.Bold) ??
+        SKTypeface.Default;
 
     public MemoryStream Render(RankCardData data, Stream? avatarStream)
     {
-        using var bitmap = new Bitmap(Width, Height, PixelFormat.Format32bppArgb);
-        using var graphics = Graphics.FromImage(bitmap);
-        graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+        var accent = ParseColor(data.AccentColor);
+        using var bitmap = new SKBitmap(
+            new SKImageInfo(
+                Width,
+                Height,
+                SKColorType.Rgba8888,
+                SKAlphaType.Premul));
+        using var canvas = new SKCanvas(bitmap);
+        canvas.Clear(SKColors.Transparent);
 
-        using var background = new LinearGradientBrush(
-            new Rectangle(0, 0, Width, Height),
-            Color.FromArgb(53, 59, 91),
-            Color.FromArgb(21, 23, 31),
-            LinearGradientMode.Horizontal);
-        using var cardPath = CreateRoundedRectangle(
-            new RectangleF(2, 2, Width - 4, Height - 4),
-            20);
-        graphics.FillPath(background, cardPath);
-        using var borderPen = new Pen(Accent, 4);
-        graphics.DrawPath(borderPen, cardPath);
+        DrawBackground(canvas, accent);
+        DrawAvatar(canvas, avatarStream, data.Username, accent);
+        DrawText(canvas, data);
+        DrawProgress(canvas, data.ProgressRatio, accent);
 
-        DrawAvatar(graphics, avatarStream, data.Username);
-        DrawText(graphics, data);
-        DrawProgress(graphics, data.ProgressRatio);
-
+        using var image = SKImage.FromBitmap(bitmap);
+        using var encoded = image.Encode(SKEncodedImageFormat.Png, 100);
         var stream = new MemoryStream();
-        bitmap.Save(stream, ImageFormat.Png);
+        encoded.SaveTo(stream);
         stream.Position = 0;
         return stream;
     }
 
+    private static void DrawBackground(SKCanvas canvas, SKColor accent)
+    {
+        var card = new SKRoundRect(
+            new SKRect(2, 2, Width - 2, Height - 2),
+            20,
+            20);
+        using var fill = new SKPaint
+        {
+            IsAntialias = true,
+            Shader = SKShader.CreateLinearGradient(
+                new SKPoint(0, 0),
+                new SKPoint(Width, 0),
+                [new SKColor(53, 59, 91), new SKColor(21, 23, 31)],
+                null,
+                SKShaderTileMode.Clamp)
+        };
+        canvas.DrawRoundRect(card, fill);
+
+        using var border = new SKPaint
+        {
+            IsAntialias = true,
+            Color = accent,
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = 4
+        };
+        canvas.DrawRoundRect(card, border);
+    }
+
     private static void DrawAvatar(
-        Graphics graphics,
+        SKCanvas canvas,
         Stream? avatarStream,
-        string displayName)
+        string username,
+        SKColor accent)
     {
         const float outerX = 18;
         const float outerY = 18;
@@ -56,158 +83,244 @@ public sealed class RankCardRenderer
         const float innerY = 34;
         const float innerSize = 158;
 
-        using var avatarBackground = new SolidBrush(Color.FromArgb(17, 19, 26));
-        graphics.FillEllipse(avatarBackground, outerX, outerY, outerSize, outerSize);
-        using var avatarBorder = new Pen(Accent, 6);
-        graphics.DrawEllipse(avatarBorder, outerX + 3, outerY + 3, outerSize - 6, outerSize - 6);
-
-        var previousClip = graphics.Clip;
-        using var avatarClip = new GraphicsPath();
-        avatarClip.AddEllipse(innerX, innerY, innerSize, innerSize);
-        graphics.SetClip(avatarClip);
-
-        if (avatarStream is not null)
+        using var background = new SKPaint
         {
-            using var avatar = Image.FromStream(avatarStream);
+            IsAntialias = true,
+            Color = new SKColor(17, 19, 26)
+        };
+        canvas.DrawCircle(
+            outerX + outerSize / 2,
+            outerY + outerSize / 2,
+            outerSize / 2,
+            background);
+
+        using var border = new SKPaint
+        {
+            IsAntialias = true,
+            Color = accent,
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = 6
+        };
+        canvas.DrawCircle(
+            outerX + outerSize / 2,
+            outerY + outerSize / 2,
+            outerSize / 2 - 3,
+            border);
+
+        canvas.Save();
+        using var clip = new SKPath();
+        clip.AddCircle(
+            innerX + innerSize / 2,
+            innerY + innerSize / 2,
+            innerSize / 2);
+        canvas.ClipPath(clip, SKClipOperation.Intersect, antialias: true);
+
+        using var avatar = TryDecodeAvatar(avatarStream);
+        if (avatar is not null)
+        {
             var source = GetCenteredSquare(avatar.Width, avatar.Height);
-            graphics.DrawImage(
-                avatar,
-                new RectangleF(innerX, innerY, innerSize, innerSize),
-                source,
-                GraphicsUnit.Pixel);
+            var destination = new SKRect(
+                innerX,
+                innerY,
+                innerX + innerSize,
+                innerY + innerSize);
+            using var imagePaint = new SKPaint { IsAntialias = true };
+            canvas.DrawBitmap(avatar, source, destination, imagePaint);
         }
         else
         {
-            using var fallback = new LinearGradientBrush(
-                new RectangleF(innerX, innerY, innerSize, innerSize),
-                Color.FromArgb(67, 74, 112),
-                Color.FromArgb(24, 27, 39),
-                LinearGradientMode.ForwardDiagonal);
-            graphics.FillEllipse(fallback, innerX, innerY, innerSize, innerSize);
-            using var initialsFont = new Font(
-                "Arial",
-                64,
-                FontStyle.Bold,
-                GraphicsUnit.Pixel);
-            using var initialsBrush = new SolidBrush(TextColor);
-            var initial = string.IsNullOrWhiteSpace(displayName)
+            using var fallback = new SKPaint
+            {
+                IsAntialias = true,
+                Shader = SKShader.CreateLinearGradient(
+                    new SKPoint(innerX, innerY),
+                    new SKPoint(innerX + innerSize, innerY + innerSize),
+                    [new SKColor(67, 74, 112), new SKColor(24, 27, 39)],
+                    null,
+                    SKShaderTileMode.Clamp)
+            };
+            canvas.DrawCircle(
+                innerX + innerSize / 2,
+                innerY + innerSize / 2,
+                innerSize / 2,
+                fallback);
+
+            var initial = string.IsNullOrWhiteSpace(username)
                 ? "?"
-                : displayName.Trim()[0].ToString().ToUpperInvariant();
-            var size = graphics.MeasureString(initial, initialsFont);
-            graphics.DrawString(
+                : username.Trim()[0].ToString().ToUpperInvariant();
+            using var initialStyle = CreateTextStyle(64, bold: true, TextColor);
+            var width = initialStyle.Font.MeasureText(initial);
+            var metrics = initialStyle.Font.Metrics;
+            var baseline =
+                innerY + innerSize / 2 - (metrics.Ascent + metrics.Descent) / 2;
+            canvas.DrawText(
                 initial,
-                initialsFont,
-                initialsBrush,
-                innerX + (innerSize - size.Width) / 2,
-                innerY + (innerSize - size.Height) / 2);
+                innerX + (innerSize - width) / 2,
+                baseline,
+                SKTextAlign.Left,
+                initialStyle.Font,
+                initialStyle.Paint);
         }
 
-        graphics.Clip = previousClip;
+        canvas.Restore();
     }
 
-    private static void DrawText(Graphics graphics, RankCardData data)
+    private static void DrawText(SKCanvas canvas, RankCardData data)
     {
-        using var playerFont = new Font("Arial", 38, FontStyle.Bold, GraphicsUnit.Pixel);
-        using var labelFont = new Font("Arial", 29, FontStyle.Regular, GraphicsUnit.Pixel);
-        using var valueFont = new Font("Arial", 66, FontStyle.Regular, GraphicsUnit.Pixel);
-        using var xpFont = new Font("Arial", 31, FontStyle.Regular, GraphicsUnit.Pixel);
-        using var textBrush = new SolidBrush(TextColor);
-        using var mutedBrush = new SolidBrush(MutedTextColor);
+        using var playerStyle = CreateTextStyle(38, bold: true, TextColor);
+        using var labelStyle = CreateTextStyle(29, bold: false, MutedTextColor);
+        using var valueStyle = CreateTextStyle(66, bold: false, TextColor);
+        using var xpStyle = CreateTextStyle(31, bold: false, MutedTextColor);
 
-        var username = TrimToWidth(graphics, data.Username, playerFont, 430);
-        graphics.DrawString(username, playerFont, textBrush, 278, 102);
+        var username = TrimToWidth(data.Username, playerStyle.Font, 430);
+        canvas.DrawText(
+            username,
+            278,
+            140,
+            SKTextAlign.Left,
+            playerStyle.Font,
+            playerStyle.Paint);
 
         var segments = new[]
         {
-            new TextSegment("RANG", labelFont, mutedBrush, 16),
-            new TextSegment($"#{data.Rank}", valueFont, textBrush, 16),
-            new TextSegment("LEVEL", labelFont, mutedBrush, 16),
-            new TextSegment(data.Level.ToString(), valueFont, textBrush, 0)
+            new TextSegment("RANG", labelStyle, 16),
+            new TextSegment($"#{data.Rank}", valueStyle, 16),
+            new TextSegment("LEVEL", labelStyle, 16),
+            new TextSegment(data.Level.ToString(), valueStyle, 0)
         };
         var totalWidth = segments.Sum(segment =>
-            graphics.MeasureString(segment.Text, segment.Font).Width + segment.Gap);
+            segment.Style.Font.MeasureText(segment.Text) + segment.Gap);
         var x = Width - 24 - totalWidth;
         foreach (var segment in segments)
         {
-            var size = graphics.MeasureString(segment.Text, segment.Font);
-            graphics.DrawString(
+            var baseline = segment.Style.Font.Size >= 60 ? 76 : 63;
+            canvas.DrawText(
                 segment.Text,
-                segment.Font,
-                segment.Brush,
                 x,
-                22 + (66 - size.Height) / 2);
-            x += size.Width + segment.Gap;
+                baseline,
+                SKTextAlign.Left,
+                segment.Style.Font,
+                segment.Style.Paint);
+            x += segment.Style.Font.MeasureText(segment.Text) + segment.Gap;
         }
 
         var xpText =
-            $"{FormatCompact(data.CurrentLevelProgress)} / {FormatCompact(data.XpForNextLevel)} XP";
-        var xpSize = graphics.MeasureString(xpText, xpFont);
-        graphics.DrawString(xpText, xpFont, mutedBrush, Width - 24 - xpSize.Width, 116);
+            $"{FormatCompact(data.CurrentLevelProgress)} / " +
+            $"{FormatCompact(data.XpForNextLevel)} XP";
+        canvas.DrawText(
+            xpText,
+            Width - 24 - xpStyle.Font.MeasureText(xpText),
+            143,
+            SKTextAlign.Left,
+            xpStyle.Font,
+            xpStyle.Paint);
     }
 
-    private static void DrawProgress(Graphics graphics, double progressRatio)
+    private static void DrawProgress(
+        SKCanvas canvas,
+        double progressRatio,
+        SKColor accent)
     {
-        var outer = new RectangleF(268, 158, 794, 58);
-        using var outerPath = CreateRoundedRectangle(outer, 18);
-        using var border = new Pen(Accent, 4);
-        graphics.DrawPath(border, outerPath);
+        var outer = new SKRoundRect(
+            new SKRect(268, 158, 1062, 216),
+            18,
+            18);
+        using var border = new SKPaint
+        {
+            IsAntialias = true,
+            Color = accent,
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = 4
+        };
+        canvas.DrawRoundRect(outer, border);
 
         var ratio = Math.Clamp(progressRatio, 0, 1);
-        var fillWidth = (float)((outer.Width - 10) * ratio);
+        var fillWidth = (float)((outer.Rect.Width - 10) * ratio);
         if (fillWidth <= 0)
         {
             return;
         }
 
-        var fill = new RectangleF(outer.X + 5, outer.Y + 5, fillWidth, outer.Height - 10);
-        using var fillPath = CreateRoundedRectangle(fill, Math.Min(10, fill.Width / 2));
-        using var fillBrush = new SolidBrush(Accent);
-        graphics.FillPath(fillBrush, fillPath);
+        var fill = new SKRoundRect(
+            new SKRect(273, 163, 273 + fillWidth, 211),
+            Math.Min(10, fillWidth / 2),
+            Math.Min(10, fillWidth / 2));
+        using var fillPaint = new SKPaint
+        {
+            IsAntialias = true,
+            Color = accent
+        };
+        canvas.DrawRoundRect(fill, fillPaint);
     }
 
-    private static Rectangle GetCenteredSquare(int width, int height)
+    private static TextStyle CreateTextStyle(
+        float size,
+        bool bold,
+        SKColor color)
+    {
+        var font = new SKFont(bold ? BoldTypeface : NormalTypeface, size);
+        var paint = new SKPaint
+        {
+            IsAntialias = true,
+            Color = color
+        };
+        return new TextStyle(font, paint);
+    }
+
+    private static SKBitmap? TryDecodeAvatar(Stream? avatarStream)
+    {
+        if (avatarStream is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            avatarStream.Position = 0;
+            return SKBitmap.Decode(avatarStream);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static SKRect GetCenteredSquare(int width, int height)
     {
         var size = Math.Min(width, height);
-        return new Rectangle((width - size) / 2, (height - size) / 2, size, size);
-    }
-
-    private static GraphicsPath CreateRoundedRectangle(RectangleF rectangle, float radius)
-    {
-        var diameter = radius * 2;
-        var path = new GraphicsPath();
-        path.AddArc(rectangle.X, rectangle.Y, diameter, diameter, 180, 90);
-        path.AddArc(rectangle.Right - diameter, rectangle.Y, diameter, diameter, 270, 90);
-        path.AddArc(
-            rectangle.Right - diameter,
-            rectangle.Bottom - diameter,
-            diameter,
-            diameter,
-            0,
-            90);
-        path.AddArc(rectangle.X, rectangle.Bottom - diameter, diameter, diameter, 90, 90);
-        path.CloseFigure();
-        return path;
+        var left = (width - size) / 2f;
+        var top = (height - size) / 2f;
+        return new SKRect(left, top, left + size, top + size);
     }
 
     private static string TrimToWidth(
-        Graphics graphics,
         string value,
-        Font font,
+        SKFont font,
         float maxWidth)
     {
-        if (graphics.MeasureString(value, font).Width <= maxWidth)
+        if (font.MeasureText(value) <= maxWidth)
         {
             return value;
         }
 
         var trimmed = value;
         while (trimmed.Length > 1 &&
-               graphics.MeasureString($"{trimmed}…", font).Width > maxWidth)
+               font.MeasureText($"{trimmed}…") > maxWidth)
         {
             trimmed = trimmed[..^1];
         }
 
         return $"{trimmed}…";
+    }
+
+    private static SKColor ParseColor(string value)
+    {
+        if (SKColor.TryParse(value, out var color))
+        {
+            return color;
+        }
+
+        return SKColors.White;
     }
 
     private static string FormatCompact(long value)
@@ -222,9 +335,20 @@ public sealed class RankCardRenderer
 
     private sealed record TextSegment(
         string Text,
-        Font Font,
-        Brush Brush,
+        TextStyle Style,
         float Gap);
+
+    private sealed class TextStyle(SKFont font, SKPaint paint) : IDisposable
+    {
+        public SKFont Font { get; } = font;
+        public SKPaint Paint { get; } = paint;
+
+        public void Dispose()
+        {
+            Font.Dispose();
+            Paint.Dispose();
+        }
+    }
 }
 
 public sealed record RankCardData(
@@ -232,7 +356,8 @@ public sealed record RankCardData(
     int Rank,
     int Level,
     long CurrentLevelProgress,
-    int XpForNextLevel)
+    int XpForNextLevel,
+    string AccentColor = "#FFFFFF")
 {
     public double ProgressRatio =>
         XpForNextLevel <= 0

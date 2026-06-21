@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using Discord;
 using Discord.Net;
 using Discord.Rest;
@@ -12,6 +14,13 @@ namespace DiscordXpBot.Services;
 
 public sealed class DiscordXpBotService : IAsyncDisposable
 {
+    private const string DatabaseSnapshotMarker = "BOT_DB_V1";
+    private static readonly JsonSerializerOptions DatabaseJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true
+    };
+
     private readonly BotOptions _options;
     private readonly BotDatabase _database;
     private readonly DiscordSocketClient _client;
@@ -20,6 +29,8 @@ public sealed class DiscordXpBotService : IAsyncDisposable
     private readonly SemaphoreSlim _inviteRecalculateGate = new(1, 1);
     private readonly SemaphoreSlim _messageScanGate = new(1, 1);
     private readonly SemaphoreSlim _liveMessageGate = new(1, 1);
+    private readonly SemaphoreSlim _databaseSnapshotGate = new(1, 1);
+    private readonly object _databaseSnapshotScheduleLock = new();
     private readonly HttpClient _httpClient = new();
     private readonly RankCardRenderer _rankCardRenderer = new();
     private readonly HashSet<ulong> _botMasterRoleIds;
@@ -29,9 +40,13 @@ public sealed class DiscordXpBotService : IAsyncDisposable
     private SocketGuild? _guild;
     private ITextChannel? _botTextChannel;
     private ITextChannel? _levelUpChannel;
+    private ITextChannel? _databaseChannel;
+    private ulong? _databaseSnapshotMessageId;
+    private CancellationTokenSource? _databaseSnapshotDelayCts;
     private Task? _inviteRewardLoop;
     private Task? _voiceCheckpointLoop;
     private Task? _messageHistoryTask;
+    private Task? _databaseSnapshotTask;
     private int _readyInitialized;
     private int _messageRecalculationInProgress;
 
@@ -88,6 +103,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 await CheckpointAllVoiceUsersAsync(announce: false);
             }
 
+            await FlushDatabaseSnapshotAsync();
             await _client.StopAsync();
             await WaitForBackgroundTaskAsync(_inviteRewardLoop);
             await WaitForBackgroundTaskAsync(_voiceCheckpointLoop);
@@ -125,6 +141,20 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             catch (Exception exception)
             {
                 await LogExceptionAsync("BotChannelInitialization", exception);
+            }
+        }
+
+        if (_options.DatabaseChannel.Enabled)
+        {
+            try
+            {
+                _databaseChannel = await GetOrCreateDatabaseChannelAsync();
+                await RestoreDatabaseSnapshotAsync();
+                ScheduleDatabaseSnapshot();
+            }
+            catch (Exception exception)
+            {
+                await LogExceptionAsync("DatabaseChannelInitialization", exception);
             }
         }
 
@@ -248,6 +278,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         }
 
         await _database.EnsureUserAccountsAsync(member.Guild.Id, [member.Id]);
+        ScheduleDatabaseSnapshot();
 
         if (!_options.InviteTracking.Enabled)
         {
@@ -458,6 +489,32 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
         try
         {
+            if (message is SocketUserMessage helpMessage &&
+                TryGetCommandArguments(
+                    helpMessage.Content,
+                    "!help",
+                    out var helpArguments))
+            {
+                await HandleHelpCommandAsync(
+                    helpMessage,
+                    guildChannel.Guild,
+                    helpArguments);
+                return;
+            }
+
+            if (message is SocketUserMessage colorMessage &&
+                TryGetCommandArguments(
+                    colorMessage.Content,
+                    "!set-rank-color",
+                    out var colorArguments))
+            {
+                await HandleSetRankColorCommandAsync(
+                    colorMessage,
+                    guildChannel.Guild,
+                    colorArguments);
+                return;
+            }
+
             if (message is SocketUserMessage userMessage &&
                 TryGetCommandArguments(
                     userMessage.Content,
@@ -689,6 +746,9 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         var account = await _database.GetInternalXpAccountAsync(
             guild.Id,
             targetUser.Id);
+        var rankColor = await _database.GetRankColorAsync(
+            guild.Id,
+            targetUser.Id);
         var leaderboard = await _database.GetInternalXpLeaderboardAsync(guild.Id);
         var xpByUser = leaderboard.ToDictionary(entry => entry.UserId);
         var rankedUserIds = guild.Users
@@ -716,6 +776,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 - Voice-XP: **{account.VoiceXp:N0}**
                 - Invite-XP: **{account.InviteXp:N0}**
                 - Gewertete Nachrichten: **{account.MessageCount:N0}**
+                - Rank-Farbe: **{rankColor}**
                 """,
                 allowedMentions: AllowedMentions.None);
             return;
@@ -740,7 +801,8 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                              rank,
                              account.CurrentLevel,
                              account.CurrentLevelProgress,
-                             LevelCalculator.GetXpForNextLevel(account.CurrentLevel)),
+                             LevelCalculator.GetXpForNextLevel(account.CurrentLevel),
+                             rankColor),
                          avatarStream))
         {
             await message.Channel.SendFileAsync(rankCard, "rank.png");
@@ -798,6 +860,84 @@ public sealed class DiscordXpBotService : IAsyncDisposable
     private bool IsBotMaster(SocketGuildUser user) =>
         user.Roles.Any(role => _botMasterRoleIds.Contains(role.Id));
 
+    private async Task HandleSetRankColorCommandAsync(
+        SocketUserMessage message,
+        SocketGuild guild,
+        IReadOnlyList<string> arguments)
+    {
+        if (message.Author is not SocketGuildUser guildUser)
+        {
+            return;
+        }
+
+        if (arguments.Count != 1 ||
+            !TryNormalizeRankColor(arguments[0], out var rankColor))
+        {
+            await message.Channel.SendMessageAsync(
+                "Verwendung: `!set-rank-color #FFFFFF` – erlaubt sind genau sechs Hex-Zeichen.");
+            return;
+        }
+
+        await _database.SetRankColorAsync(guild.Id, guildUser.Id, rankColor);
+        ScheduleDatabaseSnapshot();
+        await message.Channel.SendMessageAsync(
+            $"Deine Rank-Kartenfarbe wurde auf **{rankColor}** gesetzt.");
+    }
+
+    private async Task HandleHelpCommandAsync(
+        SocketUserMessage message,
+        SocketGuild guild,
+        IReadOnlyList<string> arguments)
+    {
+        if (message.Author is not SocketGuildUser guildUser)
+        {
+            return;
+        }
+
+        if (arguments.Count != 0)
+        {
+            await message.Channel.SendMessageAsync("Verwendung: `!help`");
+            return;
+        }
+
+        var content =
+            """
+            ## Verfügbare Bot-Befehle
+            - `!help` – zeigt diese Hilfe
+            - `!myrank` – zeigt deine Rank-Karte
+            - `!myrank @user` – zeigt die Rank-Karte eines Mitglieds
+            - `!set-rank-color #FFFFFF` – setzt deine persönliche Kartenfarbe
+            """;
+
+        if (IsBotMaster(guildUser))
+        {
+            content +=
+                """
+
+                ### Bot-Master
+                - `!myrank @user debug` – zeigt interne XP-Werte
+                - `!recalculate all` – berechnet Nachrichten und Einladungen neu
+                - `!recalculate messages` – berechnet nur Nachrichten neu
+                - `!recalculate invites` – berechnet nur Einladungen neu
+                """;
+        }
+
+        if (guildUser.GuildPermissions.ManageGuild)
+        {
+            content +=
+                """
+
+                ### Serververwaltung
+                - `/xp-liste` – veröffentlicht die interne XP-Liste
+                - `/einladungen-nachbearbeiten` – aktiviert gespeicherte historische Einladungen
+                """;
+        }
+
+        await message.Channel.SendMessageAsync(
+            content,
+            allowedMentions: AllowedMentions.None);
+    }
+
     private static Task SendMyRankUsageAsync(SocketUserMessage message) =>
         message.Channel.SendMessageAsync(
             "Verwendung: `!myrank`, `!myrank @user` oder – für Bot-Master – " +
@@ -840,7 +980,25 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         return ulong.TryParse(idText, out userId);
     }
 
+    private static bool TryNormalizeRankColor(
+        string value,
+        out string rankColor)
+    {
+        rankColor = string.Empty;
+        if (value.Length != 7 ||
+            value[0] != '#' ||
+            !value.Skip(1).All(Uri.IsHexDigit))
+        {
+            return false;
+        }
+
+        rankColor = value.ToUpperInvariant();
+        return true;
+    }
+
     private static bool IsBotTextCommand(string content) =>
+        TryGetCommandArguments(content, "!help", out _) ||
+        TryGetCommandArguments(content, "!set-rank-color", out _) ||
         TryGetCommandArguments(content, "!myrank", out _) ||
         TryGetCommandArguments(content, "!recalculate", out _) ||
         TryGetCommandArguments(content, "!recalculate-invites", out _);
@@ -2315,6 +2473,297 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         return createdChannel;
     }
 
+    private async Task<ITextChannel> GetOrCreateDatabaseChannelAsync()
+    {
+        if (_guild is null)
+        {
+            throw new InvalidOperationException("Der Discord-Server ist noch nicht geladen.");
+        }
+
+        if (_options.DatabaseChannel.ChannelId != 0 &&
+            _guild.GetTextChannel(_options.DatabaseChannel.ChannelId) is { } configuredChannel)
+        {
+            return configuredChannel;
+        }
+
+        var existingChannel = _guild.TextChannels.FirstOrDefault(channel =>
+            string.Equals(
+                channel.Name,
+                _options.DatabaseChannel.ChannelName,
+                StringComparison.OrdinalIgnoreCase));
+        if (existingChannel is not null)
+        {
+            return existingChannel;
+        }
+
+        if (!_options.DatabaseChannel.CreateChannelIfMissing)
+        {
+            throw new InvalidOperationException(
+                "Der konfigurierte bot-db-Kanal wurde nicht gefunden.");
+        }
+
+        var createdChannel = await _guild.CreateTextChannelAsync(
+            _options.DatabaseChannel.ChannelName,
+            properties =>
+            {
+                properties.Topic =
+                    "Dauerhafter JSON-Snapshot für Benutzer-XP und Rank-Kartenfarben.";
+                if (_options.DatabaseChannel.CategoryId != 0)
+                {
+                    properties.CategoryId = _options.DatabaseChannel.CategoryId;
+                }
+            });
+
+        Console.WriteLine(
+            $"[{DateTimeOffset.Now:O}] Datenbankkanal #{createdChannel.Name} erstellt.");
+        return createdChannel;
+    }
+
+    private void ScheduleDatabaseSnapshot()
+    {
+        if (!_options.DatabaseChannel.Enabled || _databaseChannel is null)
+        {
+            return;
+        }
+
+        lock (_databaseSnapshotScheduleLock)
+        {
+            _databaseSnapshotDelayCts?.Cancel();
+            _databaseSnapshotDelayCts?.Dispose();
+            _databaseSnapshotDelayCts = new CancellationTokenSource();
+            _databaseSnapshotTask = WriteDatabaseSnapshotAfterDelayAsync(
+                _databaseSnapshotDelayCts.Token);
+        }
+    }
+
+    private async Task WriteDatabaseSnapshotAfterDelayAsync(
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(
+                TimeSpan.FromSeconds(
+                    _options.DatabaseChannel.SyncDelaySeconds),
+                cancellationToken);
+            await PersistDatabaseSnapshotAsync();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // A newer XP/color change replaced this pending snapshot.
+        }
+        catch (Exception exception)
+        {
+            await LogExceptionAsync("DatabaseSnapshotWrite", exception);
+        }
+    }
+
+    private async Task FlushDatabaseSnapshotAsync()
+    {
+        Task? pendingTask;
+        lock (_databaseSnapshotScheduleLock)
+        {
+            _databaseSnapshotDelayCts?.Cancel();
+            _databaseSnapshotDelayCts?.Dispose();
+            _databaseSnapshotDelayCts = null;
+            pendingTask = _databaseSnapshotTask;
+            _databaseSnapshotTask = null;
+        }
+
+        if (pendingTask is not null)
+        {
+            try
+            {
+                await pendingTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // The pending debounce was intentionally cancelled.
+            }
+        }
+
+        if (_databaseChannel is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await PersistDatabaseSnapshotAsync();
+        }
+        catch (Exception exception)
+        {
+            await LogExceptionAsync("DatabaseSnapshotFlush", exception);
+        }
+    }
+
+    private async Task PersistDatabaseSnapshotAsync()
+    {
+        if (_guild is null || _databaseChannel is null)
+        {
+            return;
+        }
+
+        await _databaseSnapshotGate.WaitAsync();
+        try
+        {
+            var profiles = await _database.GetPersistentUserProfilesAsync(_guild.Id);
+            var snapshot = new DiscordDatabaseSnapshot(
+                1,
+                _guild.Id,
+                DateTimeOffset.UtcNow,
+                profiles.Select(profile => new DiscordDatabaseUser(
+                    profile.UserId,
+                    profile.TotalXp,
+                    profile.MessageXp,
+                    profile.VoiceXp,
+                    profile.InviteXp,
+                    profile.RankColor)).ToArray());
+            var json = JsonSerializer.Serialize(snapshot, DatabaseJsonOptions);
+            var inlineContent =
+                $"{DatabaseSnapshotMarker}\n```json\n{json}\n```";
+
+            IUserMessage newMessage;
+            if (inlineContent.Length <= 2000)
+            {
+                newMessage = await _databaseChannel.SendMessageAsync(
+                    inlineContent,
+                    allowedMentions: AllowedMentions.None);
+            }
+            else
+            {
+                await using var stream = new MemoryStream(
+                    Encoding.UTF8.GetBytes(json),
+                    writable: false);
+                newMessage = await _databaseChannel.SendFileAsync(
+                    stream,
+                    "bot-db.json",
+                    $"{DatabaseSnapshotMarker}\nDer JSON-Snapshot befindet sich im Anhang.",
+                    allowedMentions: AllowedMentions.None);
+            }
+
+            var previousMessageId = _databaseSnapshotMessageId;
+            _databaseSnapshotMessageId = newMessage.Id;
+            if (previousMessageId is { } previousId &&
+                previousId != newMessage.Id)
+            {
+                try
+                {
+                    var previous =
+                        await _databaseChannel.GetMessageAsync(previousId);
+                    if (previous is not null)
+                    {
+                        await previous.DeleteAsync();
+                    }
+                }
+                catch (Exception exception)
+                {
+                    await LogExceptionAsync(
+                        "DatabaseSnapshotDeletePrevious",
+                        exception);
+                }
+            }
+
+            if (_options.Debug.Enabled)
+            {
+                Console.WriteLine(
+                    $"[{DateTimeOffset.Now:O}] [DEBUG] [BOT-DB] " +
+                    $"Snapshot gespeichert | Benutzer={profiles.Count} | " +
+                    $"Nachricht={newMessage.Id}");
+            }
+        }
+        finally
+        {
+            _databaseSnapshotGate.Release();
+        }
+    }
+
+    private async Task RestoreDatabaseSnapshotAsync()
+    {
+        if (_guild is null || _databaseChannel is null)
+        {
+            return;
+        }
+
+        var messages = await _databaseChannel
+            .GetMessagesAsync(100)
+            .FlattenAsync();
+        var snapshotMessage = messages
+            .OfType<IUserMessage>()
+            .Where(message =>
+                message.Author.Id == _client.CurrentUser.Id &&
+                message.Content.StartsWith(
+                    DatabaseSnapshotMarker,
+                    StringComparison.Ordinal))
+            .OrderByDescending(message => message.Timestamp)
+            .FirstOrDefault();
+        if (snapshotMessage is null)
+        {
+            Console.WriteLine(
+                $"[{DateTimeOffset.Now:O}] [BOT-DB] Noch kein Snapshot vorhanden.");
+            return;
+        }
+
+        _databaseSnapshotMessageId = snapshotMessage.Id;
+        var json = await ReadDatabaseSnapshotJsonAsync(snapshotMessage);
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            throw new InvalidOperationException(
+                "Die bot-db-Nachricht enthält keinen lesbaren JSON-Snapshot.");
+        }
+
+        var snapshot = JsonSerializer.Deserialize<DiscordDatabaseSnapshot>(
+            json,
+            DatabaseJsonOptions);
+        if (snapshot is null || snapshot.GuildId != _guild.Id)
+        {
+            throw new InvalidOperationException(
+                "Der bot-db-Snapshot gehört nicht zum aktuellen Discord-Server.");
+        }
+
+        var result = await _database.RestorePersistentUserProfilesAsync(
+            _guild.Id,
+            snapshot.Users.Select(user => new PersistentUserProfile(
+                user.UserId,
+                user.MessageXp,
+                user.VoiceXp,
+                user.InviteXp,
+                user.RankColor)).ToArray(),
+            snapshot.GeneratedAtUtc);
+        Console.WriteLine(
+            $"[{DateTimeOffset.Now:O}] [BOT-DB] Snapshot gelesen | " +
+            $"XP-Restore={(result.XpRestoreApplied ? "ja" : "nicht nötig")} | " +
+            $"XP-Benutzer={result.RestoredXpUsers} | Farben={result.RestoredColors}");
+    }
+
+    private async Task<string?> ReadDatabaseSnapshotJsonAsync(
+        IUserMessage message)
+    {
+        const string jsonStart = "```json\n";
+        var startIndex = message.Content.IndexOf(
+            jsonStart,
+            StringComparison.Ordinal);
+        if (startIndex >= 0)
+        {
+            startIndex += jsonStart.Length;
+            var endIndex = message.Content.LastIndexOf(
+                "\n```",
+                StringComparison.Ordinal);
+            if (endIndex > startIndex)
+            {
+                return message.Content[startIndex..endIndex];
+            }
+        }
+
+        var attachment = message.Attachments.FirstOrDefault(item =>
+            string.Equals(
+                item.Filename,
+                "bot-db.json",
+                StringComparison.OrdinalIgnoreCase));
+        return attachment is null
+            ? null
+            : await _httpClient.GetStringAsync(attachment.Url);
+    }
+
     private async Task<ITextChannel?> GetOrCreateLevelUpChannelAsync()
     {
         if (_guild is null || !_options.Levels.Enabled)
@@ -2386,10 +2835,15 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
     private void LogXpMovement(XpMovementResult? movement)
     {
-        if (!_options.Debug.Enabled ||
-            movement is null ||
+        if (movement is null ||
             !movement.Applied ||
             movement.Amount == 0)
+        {
+            return;
+        }
+
+        ScheduleDatabaseSnapshot();
+        if (!_options.Debug.Enabled)
         {
             return;
         }
@@ -2462,12 +2916,20 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        lock (_databaseSnapshotScheduleLock)
+        {
+            _databaseSnapshotDelayCts?.Cancel();
+            _databaseSnapshotDelayCts?.Dispose();
+            _databaseSnapshotDelayCts = null;
+        }
+
         await _client.DisposeAsync();
         _httpClient.Dispose();
         _inviteGate.Dispose();
         _inviteRecalculateGate.Dispose();
         _messageScanGate.Dispose();
         _liveMessageGate.Dispose();
+        _databaseSnapshotGate.Dispose();
     }
 
     private sealed record InviteSnapshot(int Uses, ulong? InviterId);
@@ -2505,6 +2967,20 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         int InviteXpAwarded,
         string? InviteBackfillError,
         bool InvitesIncluded);
+
+    private sealed record DiscordDatabaseSnapshot(
+        int Version,
+        ulong GuildId,
+        DateTimeOffset GeneratedAtUtc,
+        IReadOnlyList<DiscordDatabaseUser> Users);
+
+    private sealed record DiscordDatabaseUser(
+        ulong UserId,
+        long TotalXp,
+        long MessageXp,
+        long VoiceXp,
+        long InviteXp,
+        string RankColor);
 
     private sealed record MessageChannelProgress(
         int Scanned,
