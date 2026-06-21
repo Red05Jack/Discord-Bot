@@ -10,6 +10,7 @@ public sealed class BotOptions
     public MessageXpOptions Messages { get; set; } = new();
     public LevelSystemOptions Levels { get; set; } = new();
     public XpOptions Xp { get; set; } = new();
+    public CommandOptions Commands { get; set; } = new();
     public BotChannelOptions BotChannel { get; set; } = new();
     public AnnouncementOptions Announcements { get; set; } = new();
     public DebugOptions Debug { get; set; } = new();
@@ -31,6 +32,8 @@ public sealed class BotOptions
             ReadCommentHandling = JsonCommentHandling.Skip,
             AllowTrailingCommas = true
         }) ?? throw new InvalidOperationException("Die Konfiguration konnte nicht gelesen werden.");
+        options.Commands ??= new CommandOptions();
+        options.Commands.BotMasterRoleIds ??= [];
 
         var tokenFromEnvironment = Environment.GetEnvironmentVariable("DISCORD_BOT_TOKEN");
         if (!string.IsNullOrWhiteSpace(tokenFromEnvironment))
@@ -125,6 +128,12 @@ public sealed class BotOptions
             throw new InvalidOperationException(
                 "Levels.LevelUpChannelName must be set when no LevelUpChannelId is configured.");
         }
+
+        if (Commands.BotMasterRoleIds.Any(roleId => roleId == 0))
+        {
+            throw new InvalidOperationException(
+                "Commands.BotMasterRoleIds darf keine Rollen-ID 0 enthalten.");
+        }
     }
 
     private static void ValidateRange(int min, int max, string minName, string maxName)
@@ -181,6 +190,11 @@ public sealed class MessageXpOptions
 public sealed class XpOptions
 {
     public string DatabasePath { get; set; } = string.Empty;
+}
+
+public sealed class CommandOptions
+{
+    public List<ulong> BotMasterRoleIds { get; set; } = [];
 }
 
 public sealed class LevelSystemOptions

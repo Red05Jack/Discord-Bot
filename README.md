@@ -44,14 +44,18 @@ durch einen Administratorbefehl ausgelöst.
 
 ### `!recalculate`
 
-Ein Mitglied mit der Berechtigung **Server verwalten** kann den gesamten Nachrichtenbestand
-neu berechnen:
+Nur Mitglieder mit einer unter `Commands.BotMasterRoleIds` eingetragenen Rolle dürfen
+Neuberechnungen starten:
 
 ```text
-!recalculate
+!recalculate all
+!recalculate messages
+!recalculate invites
 ```
 
-Der Bot merkt sich den exakten Startzeitpunkt und arbeitet anschließend in zwei Phasen:
+`all` berechnet Nachrichten und verfügbare Einladungszuordnungen neu. `messages` verändert
+nur Nachrichten-XP, `invites` nur Invite-XP. Der Nachrichtenscan merkt sich den exakten
+Startzeitpunkt und arbeitet anschließend in zwei Phasen:
 
 1. Alle erreichbaren Nachrichten vor dem Startzeitpunkt werden historisch eingelesen.
 2. Danach werden Nachrichten ab dem Startzeitpunkt in einem schnellen Catch-up-Durchlauf
@@ -77,20 +81,22 @@ Die Konsole zeigt zusätzlich Kanalstarts, gelesene Chargen, Threads, Catch-up u
 
 ```text
 !myrank
+!myrank @user
 ```
 
 Sendet ohne Begleittext eine PNG-Rangkarte auf Basis der bereitgestellten `rank.html`.
-Die Karte zeigt Discord-Avatar, Anzeigename, Rang unter den aktuellen Servermitgliedern,
+Ohne Erwähnung wird die eigene Karte gesendet, mit Erwähnung die Karte des gewählten
+Servermitglieds. Die Karte zeigt Discord-Avatar, Benutzername, Rang unter den aktuellen Servermitgliedern,
 Level und Fortschritt bis zum nächsten Level.
 
-### `!recalculate-invites`
+Bot-Master können zusätzlich interne Werte prüfen:
 
 ```text
-!recalculate-invites
+!myrank @user debug
 ```
 
-Berechnet ausschließlich die verfügbaren Invite-Zuordnungen neu. Nachrichten- und Voice-XP
-werden dabei nicht verändert. Der Befehl benötigt **Server verwalten**.
+Der Debug-Modus zeigt Gesamt-, Nachrichten-, Voice- und Invite-XP sowie die gespeicherte
+Nachrichtenanzahl.
 
 ## Voice-XP
 
@@ -165,6 +171,17 @@ Weitere unterstützte Umgebungsvariablen:
 Der Bot-Ausgabekanal wird über `BotChannel.ChannelId` oder `BotChannel.ChannelName`
 ausgewählt. Mit `BotChannel.CreateChannelIfMissing: true` wird er bei Bedarf erstellt.
 
+Bot-Master-Rollen werden als erweiterbare Liste konfiguriert:
+
+```json
+"Commands": {
+  "BotMasterRoleIds": [
+    872554803857854514,
+    998703882001723502
+  ]
+}
+```
+
 Mit `"Debug": { "Enabled": true }` zeigt die Konsole erkannte Voice-Bewegungen und jede
 tatsächlich angewendete positive oder negative XP-Bewegung.
 
@@ -184,7 +201,10 @@ dotnet run --project tests/DiscordXpBot.SelfTest.csproj
 ## Befehle
 
 - `!myrank` – sendet die eigene Rank-Karte als Bild
-- `!recalculate` – berechnet Nachrichten und verfügbare Invite-Zuordnungen neu
-- `!recalculate-invites` – berechnet ausschließlich Invite-Zuordnungen neu
+- `!myrank @user` – sendet die Rank-Karte eines Servermitglieds
+- `!myrank @user debug` – zeigt Master-Rollen die internen XP-Werte
+- `!recalculate all` – berechnet Nachrichten und Invite-Zuordnungen neu
+- `!recalculate messages` – berechnet ausschließlich Nachrichten neu
+- `!recalculate invites` – berechnet ausschließlich Invite-Zuordnungen neu
 - `/xp-liste` – sendet die aktuelle interne XP-Liste in den Bot-Textkanal
 - `/einladungen-nachbearbeiten` – aktiviert gespeicherte historische Einladungen
