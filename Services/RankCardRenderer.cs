@@ -34,7 +34,7 @@ public sealed class RankCardRenderer
         using var borderPen = new Pen(Accent, 4);
         graphics.DrawPath(borderPen, cardPath);
 
-        DrawAvatar(graphics, avatarStream, data.DisplayName);
+        DrawAvatar(graphics, avatarStream, data.Username);
         DrawText(graphics, data);
         DrawProgress(graphics, data.ProgressRatio);
 
@@ -114,8 +114,8 @@ public sealed class RankCardRenderer
         using var textBrush = new SolidBrush(TextColor);
         using var mutedBrush = new SolidBrush(MutedTextColor);
 
-        var displayName = TrimToWidth(graphics, data.DisplayName, playerFont, 430);
-        graphics.DrawString(displayName, playerFont, textBrush, 278, 102);
+        var username = TrimToWidth(graphics, data.Username, playerFont, 430);
+        graphics.DrawString(username, playerFont, textBrush, 278, 102);
 
         var segments = new[]
         {
@@ -228,7 +228,7 @@ public sealed class RankCardRenderer
 }
 
 public sealed record RankCardData(
-    string DisplayName,
+    string Username,
     int Rank,
     int Level,
     long CurrentLevelProgress,

@@ -2,6 +2,8 @@ using DiscordXpBot.Data;
 using DiscordXpBot.Leveling;
 using DiscordXpBot.Services;
 using Microsoft.Data.Sqlite;
+using System.Security.Cryptography;
+using System.Text;
 
 var databasePath = Path.Combine(
     Path.GetTempPath(),
@@ -197,6 +199,41 @@ try
         duplicateInviteMemberBackfill.ImportedMembers == 0 &&
         historicalInviterAccount.InviteXp == 500,
         "Dieselben konkreten Invite-Mitglieder konnten doppelt vergütet werden.");
+
+    const ulong recoveredInviteMemberId = 305;
+    const string recoveredInviteCode = "recovered-code";
+    var recoveredJoinedAt = now.AddDays(-10);
+    var recoveredIdentity =
+        $"{guildId}:{recoveredInviteMemberId}:{recoveredInviteCode}:" +
+        $"{recoveredJoinedAt.UtcTicks}";
+    var recoveredHash = SHA256.HashData(Encoding.UTF8.GetBytes(recoveredIdentity));
+    var recoveredRewardId = Convert.ToHexString(
+        recoveredHash.AsSpan(0, 16)).ToLowerInvariant();
+    await database.AddXpAsync(
+        guildId,
+        historicalInviterId,
+        500,
+        "invite-reward",
+        $"invite-reward:{recoveredRewardId}",
+        now.AddMinutes(2));
+    var recoveredBackfill = await database.BackfillInviteMembersAsync(
+        guildId,
+        [
+            new HistoricalInviteMember(
+                recoveredInviteMemberId,
+                historicalInviterId,
+                recoveredInviteCode,
+                recoveredJoinedAt)
+        ],
+        now.AddDays(-7),
+        minXp: 500,
+        maxXp: 500,
+        now.AddMinutes(3));
+    Assert(
+        recoveredBackfill.ImportedMembers == 1 &&
+        recoveredBackfill.AlreadyTrackedMembers == 1 &&
+        recoveredBackfill.RewardedMembers == 0,
+        "Ein bereits im XP-Ledger vorhandener Invite hat den Rücklauf nicht idempotent überstanden.");
 
     const ulong voiceUserId = 400;
     await database.StartVoiceSessionAsync(
@@ -495,17 +532,29 @@ try
         migratedInvite is { AutoProcess: false, RewardGiven: true },
         "Ein alter Invite-Datensatz wurde nicht sicher als manueller Backfill migriert.");
     Assert(
-        await migratedDatabase.GetInviteLedgerEntryCountAsync(guildId) == 1,
+        await migratedDatabase.GetInviteLedgerEntryCountAsync(guildId) == 2,
         "Bereits früher vergebene Invite-XP wurden nicht in das dauerhafte Ledger migriert.");
-    var migratedInternalXp = (await migratedDatabase.GetInternalXpLeaderboardAsync(guildId))
+    var migratedLeaderboard = await migratedDatabase.GetInternalXpLeaderboardAsync(guildId);
+    var recoveredInviteXp = migratedLeaderboard.Single(entry => entry.UserId == 201);
+    Assert(
+        recoveredInviteXp.TotalXp == 700 &&
+        recoveredInviteXp.InviteXp == 700,
+        "An existing invite ledger entry without internal XP was not recovered.");
+    var migratedInternalXp = migratedLeaderboard
         .Single(entry => entry.UserId == inviterId);
     Assert(
-        migratedInternalXp.TotalXp == 500,
-        "Die früheren XP wurden nicht in das neue interne XP-System migriert.");
+        migratedInternalXp.TotalXp == 525 &&
+        migratedInternalXp.InviteXp == 500 &&
+        migratedInternalXp.VoiceXp == 25,
+        "Die früheren XP oder die alte source-Spalte wurden nicht korrekt migriert.");
     Assert(
         !await TableExistsAsync(legacyDatabasePath, "xp_accounts") &&
-        !await TableExistsAsync(legacyDatabasePath, "xp_transactions"),
-        "Die alten internen XP-Konten und XP-Transaktionen wurden nicht entfernt.");
+        !await TableExistsAsync(legacyDatabasePath, "xp_transactions") &&
+        !await ColumnExistsAsync(
+            legacyDatabasePath,
+            "internal_xp_ledger",
+            "source"),
+        "Die alten XP-Tabellen oder die veraltete source-Spalte wurden nicht entfernt.");
 
     Console.WriteLine(
         "Selbsttest erfolgreich: Nachrichten-XP, internes Ledger sowie Invite- und Voice-Logik funktionieren.");
@@ -554,6 +603,15 @@ static async Task CreateLegacyDatabaseAsync(string path, DateTimeOffset now)
             reference_id TEXT NOT NULL UNIQUE,
             created_at_utc TEXT NOT NULL
         );
+        CREATE TABLE internal_xp_ledger (
+            id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            reference_id TEXT NOT NULL UNIQUE,
+            created_at_utc TEXT NOT NULL
+        );
         CREATE TABLE invite_rewards (
             id TEXT PRIMARY KEY,
             guild_id TEXT NOT NULL,
@@ -574,6 +632,18 @@ static async Task CreateLegacyDatabaseAsync(string path, DateTimeOffset now)
             started_at_utc TEXT NOT NULL,
             UNIQUE (guild_id, user_id)
         );
+        CREATE TABLE invite_xp_ledger (
+            id TEXT PRIMARY KEY,
+            invite_reward_id TEXT NOT NULL,
+            guild_id TEXT NOT NULL,
+            member_id TEXT NOT NULL,
+            inviter_id TEXT NOT NULL,
+            invite_code TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            dispatch_reference_id TEXT NOT NULL UNIQUE,
+            created_at_utc TEXT NOT NULL
+        );
         INSERT INTO invite_rewards (
             id, guild_id, member_id, inviter_id, invite_code,
             joined_at_utc, reward_xp, reward_given, rewarded_at_utc
@@ -588,6 +658,21 @@ static async Task CreateLegacyDatabaseAsync(string path, DateTimeOffset now)
         VALUES (
             'legacy-transaction', '100', '200', 500, 'invite-reward',
             'invite-reward:legacy-invite', $rewardedAt
+        );
+        INSERT INTO internal_xp_ledger (
+            id, guild_id, user_id, amount, source, reference_id, created_at_utc
+        )
+        VALUES (
+            'legacy-voice-ledger', '100', '200', 25, 'voice',
+            'voice:legacy', $rewardedAt
+        );
+        INSERT INTO invite_xp_ledger (
+            id, invite_reward_id, guild_id, member_id, inviter_id,
+            invite_code, amount, action, dispatch_reference_id, created_at_utc
+        )
+        VALUES (
+            'orphan-invite-ledger', 'orphan-invite', '100', '301', '201',
+            'orphan-code', 700, 'reward', 'invite-reward:orphan-invite', $rewardedAt
         );
         """;
     command.Parameters.AddWithValue("$joinedAt", now.AddDays(-8).UtcDateTime.ToString("O"));
@@ -609,4 +694,28 @@ static async Task<bool> TableExistsAsync(string path, string tableName)
         """;
     command.Parameters.AddWithValue("$tableName", tableName);
     return await command.ExecuteScalarAsync() is not null;
+}
+
+static async Task<bool> ColumnExistsAsync(
+    string path,
+    string tableName,
+    string columnName)
+{
+    await using var connection = new SqliteConnection($"Data Source={path}");
+    await connection.OpenAsync();
+    await using var command = connection.CreateCommand();
+    command.CommandText = $"PRAGMA table_info({tableName});";
+    await using var reader = await command.ExecuteReaderAsync();
+    while (await reader.ReadAsync())
+    {
+        if (string.Equals(
+                reader.GetString(1),
+                columnName,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+    }
+
+    return false;
 }

@@ -648,7 +648,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         await using (avatarStream)
         await using (var rankCard = _rankCardRenderer.Render(
                          new RankCardData(
-                             guildUser.DisplayName,
+                             guildUser.Username,
                              rank,
                              account.CurrentLevel,
                              account.CurrentLevelProgress,
