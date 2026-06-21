@@ -6,6 +6,7 @@ using Discord.Rest;
 using Discord.WebSocket;
 using DiscordXpBot.Configuration;
 using DiscordXpBot.Data;
+using DiscordXpBot.Leveling;
 
 namespace DiscordXpBot.Services;
 
@@ -16,27 +17,35 @@ public sealed class DiscordXpBotService : IAsyncDisposable
     private readonly DiscordSocketClient _client;
     private readonly ConcurrentDictionary<string, InviteSnapshot> _inviteCache = [];
     private readonly SemaphoreSlim _inviteGate = new(1, 1);
-    private readonly SemaphoreSlim _xpDispatchGate = new(1, 1);
+    private readonly SemaphoreSlim _inviteRecalculateGate = new(1, 1);
     private readonly SemaphoreSlim _messageScanGate = new(1, 1);
+    private readonly SemaphoreSlim _liveMessageGate = new(1, 1);
+    private readonly HttpClient _httpClient = new();
+    private readonly RankCardRenderer _rankCardRenderer = new();
+    private readonly ConcurrentDictionary<ulong, MessageXpSnapshot> _recalculateMessageBuffer = [];
+    private readonly ConcurrentDictionary<ulong, byte> _recalculateDeletedMessageIds = [];
     private CancellationToken _runToken;
     private SocketGuild? _guild;
-    private ITextChannel? _mee6CommandChannel;
+    private ITextChannel? _botTextChannel;
+    private ITextChannel? _levelUpChannel;
     private Task? _inviteRewardLoop;
     private Task? _voiceCheckpointLoop;
-    private Task? _xpDispatchLoop;
     private Task? _messageHistoryTask;
     private int _readyInitialized;
+    private int _messageRecalculationInProgress;
 
     public DiscordXpBotService(BotOptions options, BotDatabase database)
     {
         _options = options;
         _database = database;
+        _httpClient.Timeout = TimeSpan.FromSeconds(10);
         _client = new DiscordSocketClient(new DiscordSocketConfig
         {
             GatewayIntents =
                 GatewayIntents.Guilds |
                 GatewayIntents.GuildMembers |
                 GatewayIntents.GuildMessages |
+                GatewayIntents.MessageContent |
                 GatewayIntents.GuildVoiceStates |
                 GatewayIntents.GuildInvites,
             AlwaysDownloadUsers = true,
@@ -72,20 +81,14 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         }
         finally
         {
-            if (!_options.Messages.ScanOnly && _options.Voice.Enabled)
+            if (_options.Voice.Enabled)
             {
                 await CheckpointAllVoiceUsersAsync(announce: false);
-            }
-
-            if (!_options.Messages.ScanOnly && _options.Mee6Commands.Enabled)
-            {
-                await DispatchPendingXpCommandsAsync();
             }
 
             await _client.StopAsync();
             await WaitForBackgroundTaskAsync(_inviteRewardLoop);
             await WaitForBackgroundTaskAsync(_voiceCheckpointLoop);
-            await WaitForBackgroundTaskAsync(_xpDispatchLoop);
             await WaitForBackgroundTaskAsync(_messageHistoryTask);
         }
     }
@@ -99,6 +102,9 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
         _guild = ResolveConfiguredGuild();
         _options.Discord.GuildId = _guild.Id;
+        await _database.EnsureUserAccountsAsync(
+            _guild.Id,
+            _guild.Users.Select(user => user.Id));
 
         Console.WriteLine(
             $"[{DateTimeOffset.Now:O}] Verbunden als {_client.CurrentUser} mit {_guild.Name}.");
@@ -108,53 +114,78 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             $"[{DateTimeOffset.Now:O}] Debug-Protokollierung: " +
             $"{(_options.Debug.Enabled ? "aktiv" : "inaktiv")}.");
 
-        if (_options.Mee6Commands.Enabled || _options.Messages.Enabled)
+        if (_options.BotChannel.Enabled || _options.Messages.Enabled)
         {
-            _mee6CommandChannel = await GetOrCreateMee6CommandChannelAsync();
-        }
-
-        if (_options.Messages.Enabled && _options.Messages.ScanOnly)
-        {
-            Console.WriteLine(
-                $"[{DateTimeOffset.Now:O}] Scan-only-Modus aktiv: " +
-                "Voice, Einladungen, MEE6-Versand, Live-Nachrichten und Slash-Commands sind pausiert.");
-            if (_options.Discord.RegisterSlashCommands)
+            try
             {
-                await _guild.BulkOverwriteApplicationCommandAsync([]);
-                Console.WriteLine(
-                    $"[{DateTimeOffset.Now:O}] Slash-Commands für den Scan-only-Modus entfernt.");
+                _botTextChannel = await GetOrCreateBotTextChannelAsync();
             }
-
-            _messageHistoryTask = ScanMessageHistoryAndPublishAsync(_runToken);
-            return;
+            catch (Exception exception)
+            {
+                await LogExceptionAsync("BotChannelInitialization", exception);
+            }
         }
 
-        if (_options.Mee6Commands.Enabled)
+        if (_options.Levels.Enabled)
         {
-            await DispatchPendingXpCommandsAsync();
-            _xpDispatchLoop = RunXpDispatchLoopAsync(_runToken);
+            try
+            {
+                _levelUpChannel = await GetOrCreateLevelUpChannelAsync();
+            }
+            catch (Exception exception)
+            {
+                await LogExceptionAsync("LevelChannelInitialization", exception);
+            }
         }
 
         if (_options.InviteTracking.Enabled)
         {
-            await RefreshInviteCacheAsync();
-            _inviteRewardLoop = RunInviteRewardLoopAsync(_runToken);
+            try
+            {
+                await RefreshInviteCacheAsync();
+                _inviteRewardLoop = RunInviteRewardLoopAsync(_runToken);
+            }
+            catch (Exception exception)
+            {
+                await LogExceptionAsync("InviteTrackingInitialization", exception);
+            }
         }
 
         if (_options.Voice.Enabled)
         {
-            await ResetVoiceSessionsFromDiscordAsync();
+            try
+            {
+                await SynchronizeVoiceSessionsFromDiscordAsync();
+                await CheckpointAllVoiceUsersAsync(announce: false);
+            }
+            catch (Exception exception)
+            {
+                await LogExceptionAsync("VoiceTrackingInitialization", exception);
+            }
+
             _voiceCheckpointLoop = RunVoiceCheckpointLoopAsync(_runToken);
+            Console.WriteLine(
+                $"[{DateTimeOffset.Now:O}] Voice-Live-Tracking aktiv: " +
+                $"Prüfung alle {_options.Voice.CheckpointIntervalMinutes:N2} Minute(n), " +
+                $"Belohnung je {_options.Voice.RewardBlockMinutes} Minuten.");
         }
 
         if (_options.Discord.RegisterSlashCommands)
         {
-            await RegisterSlashCommandsAsync();
+            try
+            {
+                await RegisterSlashCommandsAsync();
+            }
+            catch (Exception exception)
+            {
+                await LogExceptionAsync("SlashCommandInitialization", exception);
+            }
         }
 
-        if (_options.Messages.Enabled && _options.Messages.ScanHistoryOnStartup)
+        if (_options.Messages.Enabled)
         {
-            _messageHistoryTask = ScanMessageHistoryAndPublishAsync(_runToken);
+            Console.WriteLine(
+                $"[{DateTimeOffset.Now:O}] Nachrichten-Live-Tracking aktiv.");
         }
     }
 
@@ -209,9 +240,14 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
     private async Task OnUserJoinedAsync(SocketGuildUser member)
     {
-        if (_options.Messages.ScanOnly ||
-            !_options.InviteTracking.Enabled ||
-            member.Guild.Id != _options.Discord.GuildId)
+        if (member.Guild.Id != _options.Discord.GuildId)
+        {
+            return;
+        }
+
+        await _database.EnsureUserAccountsAsync(member.Guild.Id, [member.Id]);
+
+        if (!_options.InviteTracking.Enabled)
         {
             return;
         }
@@ -262,8 +298,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
     private async Task OnUserLeftAsync(SocketGuild guild, SocketUser user)
     {
-        if (_options.Messages.ScanOnly ||
-            !_options.InviteTracking.Enabled ||
+        if (!_options.InviteTracking.Enabled ||
             guild.Id != _options.Discord.GuildId)
         {
             return;
@@ -277,13 +312,13 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 return;
             }
 
-            var deleted = await _database.RevokeInviteAndDeleteAsync(
+            var removal = await _database.RevokeInviteAndDeleteAsync(
                 invite,
                 DateTimeOffset.UtcNow);
+            LogXpMovement(removal.Movement);
 
-            if (deleted && invite.RewardGiven)
+            if (removal.Deleted && invite.RewardGiven)
             {
-                await DispatchPendingXpCommandsAsync();
                 await AnnounceAsync(
                     _options.Announcements.AnnounceInviteRevocations,
                     FormatMessage(
@@ -304,8 +339,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         SocketVoiceState before,
         SocketVoiceState after)
     {
-        if (_options.Messages.ScanOnly ||
-            user is not SocketGuildUser guildUser ||
+        if (user is not SocketGuildUser guildUser ||
             guildUser.Guild.Id != _options.Discord.GuildId)
         {
             return;
@@ -334,12 +368,13 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                     guildUser.Guild.Id,
                     user.Id,
                     DateTimeOffset.UtcNow,
-                    _options.Voice.MinXpPerMinute,
-                    _options.Voice.MaxXpPerMinute,
-                    _options.Voice.MinimumRewardableMinutes,
+                    _options.Voice.MinXpPerFiveMinutes,
+                    _options.Voice.MaxXpPerFiveMinutes,
+                    _options.Voice.RewardBlockMinutes,
                     deleteSession: true);
 
-                await DispatchPendingXpCommandsAsync();
+                LogXpMovement(reward.Movement);
+                await NotifyLevelUpAsync(reward.Movement);
                 await AnnounceVoiceRewardAsync(user.Id, reward);
             }
 
@@ -391,11 +426,6 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
     private Task OnInviteCreatedAsync(SocketInvite invite)
     {
-        if (_options.Messages.ScanOnly)
-        {
-            return Task.CompletedTask;
-        }
-
         if (invite.GuildId == _options.Discord.GuildId)
         {
             _inviteCache[invite.Code] = new InviteSnapshot(
@@ -408,11 +438,6 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
     private Task OnInviteDeletedAsync(SocketGuildChannel channel, string code)
     {
-        if (_options.Messages.ScanOnly)
-        {
-            return Task.CompletedTask;
-        }
-
         if (channel.Guild.Id == _options.Discord.GuildId)
         {
             _inviteCache.TryRemove(code, out _);
@@ -423,36 +448,109 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
     private async Task OnMessageReceivedAsync(SocketMessage message)
     {
-        if (_options.Messages.ScanOnly ||
-            !_options.Messages.Enabled ||
-            message.Channel is not SocketGuildChannel guildChannel ||
-            guildChannel.Guild.Id != _options.Discord.GuildId ||
-            !IsRewardableMessage(message))
+        if (message.Channel is not SocketGuildChannel guildChannel ||
+            guildChannel.Guild.Id != _options.Discord.GuildId)
         {
             return;
         }
 
         try
         {
+            if (message is SocketUserMessage userMessage &&
+                string.Equals(
+                    userMessage.Content.Trim(),
+                    "!recalculate",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleRecalculateCommandAsync(userMessage, guildChannel.Guild);
+                return;
+            }
+
+            if (message is SocketUserMessage rankMessage &&
+                string.Equals(
+                    rankMessage.Content.Trim(),
+                    "!myrank",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleMyRankCommandAsync(rankMessage, guildChannel.Guild);
+                return;
+            }
+
+            if (message is SocketUserMessage inviteRecalculateMessage &&
+                string.Equals(
+                    inviteRecalculateMessage.Content.Trim(),
+                    "!recalculate-invites",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleInviteRecalculateCommandAsync(
+                    inviteRecalculateMessage,
+                    guildChannel.Guild);
+                return;
+            }
+
+            if (!_options.Messages.Enabled || !IsRewardableMessage(message))
+            {
+                return;
+            }
+
             var xp = MessageXpCalculator.Calculate(
                 message.Id,
                 _options.Messages.MinXp,
                 _options.Messages.MaxXp);
-            var inserted = await _database.RegisterMessageXpAsync(
-                guildChannel.Guild.Id,
+            var snapshot = new MessageXpSnapshot(
                 message.Channel.Id,
                 message.Id,
                 message.Author.Id,
                 xp,
                 message.Timestamp);
 
-            if (_options.Debug.Enabled && inserted)
+            await _liveMessageGate.WaitAsync();
+            try
             {
-                Console.WriteLine(
-                    $"[{DateTimeOffset.Now:O}] [DEBUG] [NACHRICHT-XP] " +
-                    $"Benutzer={message.Author} ({message.Author.Id}) | " +
-                    $"Kanal={message.Channel.Name} ({message.Channel.Id}) | " +
-                    $"Nachricht={message.Id} | XP={xp}");
+                if (Volatile.Read(ref _messageRecalculationInProgress) == 1)
+                {
+                    _recalculateMessageBuffer[message.Id] = snapshot;
+                    _recalculateDeletedMessageIds.TryRemove(message.Id, out _);
+                    if (_options.Debug.Enabled)
+                    {
+                        Console.WriteLine(
+                            $"[{DateTimeOffset.Now:O}] [DEBUG] [NACHRICHT-GEPUFFERT] " +
+                            $"Benutzer={message.Author} ({message.Author.Id}) | " +
+                            $"Kanal={message.Channel.Name} ({message.Channel.Id}) | " +
+                            $"Nachricht={message.Id} | XP={xp}");
+                    }
+
+                    return;
+                }
+
+                var result = await _database.RegisterMessageXpAsync(
+                    guildChannel.Guild.Id,
+                    message.Channel.Id,
+                    message.Id,
+                    message.Author.Id,
+                    xp,
+                    message.Timestamp);
+
+                LogXpMovement(result.Movement);
+                await NotifyLevelUpAsync(result.Movement);
+                if (_options.Debug.Enabled && result.Changed)
+                {
+                    Console.WriteLine(
+                        $"[{DateTimeOffset.Now:O}] [DEBUG] [NACHRICHT-XP] " +
+                        $"Benutzer={message.Author} ({message.Author.Id}) | " +
+                        $"Kanal={message.Channel.Name} ({message.Channel.Id}) | " +
+                        $"Nachricht={message.Id} | XP={xp}");
+                }
+                else if (_options.Debug.Enabled)
+                {
+                    Console.WriteLine(
+                        $"[{DateTimeOffset.Now:O}] [DEBUG] [NACHRICHT-DUPLIKAT] " +
+                        $"Nachricht={message.Id} wurde bereits verarbeitet.");
+                }
+            }
+            finally
+            {
+                _liveMessageGate.Release();
             }
         }
         catch (Exception exception)
@@ -461,12 +559,160 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         }
     }
 
+    private async Task HandleRecalculateCommandAsync(
+        SocketUserMessage message,
+        SocketGuild guild)
+    {
+        if (message.Author is not SocketGuildUser guildUser ||
+            !guildUser.GuildPermissions.ManageGuild)
+        {
+            await message.Channel.SendMessageAsync(
+                "You need the **Manage Server** permission to run `!recalculate`.");
+            return;
+        }
+
+        if (Interlocked.CompareExchange(
+                ref _messageRecalculationInProgress,
+                1,
+                0) != 0)
+        {
+            await message.Channel.SendMessageAsync(
+                "A message XP recalculation is already running.");
+            return;
+        }
+
+        _recalculateMessageBuffer.Clear();
+        _recalculateDeletedMessageIds.Clear();
+        var startedAt = DateTimeOffset.UtcNow;
+        try
+        {
+            if (_botTextChannel is null &&
+                message.Channel is ITextChannel commandChannel)
+            {
+                _botTextChannel = commandChannel;
+            }
+
+            if (_botTextChannel is null)
+            {
+                throw new InvalidOperationException(
+                    "No text channel is available for recalculation output.");
+            }
+
+            await message.Channel.SendMessageAsync(
+                "XP recalculation started. Messages and currently available invite usages " +
+                "will be recalculated. Live voice and invite tracking remain active.");
+            _messageHistoryTask = ScanMessageHistoryAndPublishAsync(startedAt, _runToken);
+        }
+        catch
+        {
+            Interlocked.Exchange(ref _messageRecalculationInProgress, 0);
+            throw;
+        }
+    }
+
+    private async Task HandleMyRankCommandAsync(
+        SocketUserMessage message,
+        SocketGuild guild)
+    {
+        if (message.Author is not SocketGuildUser guildUser)
+        {
+            return;
+        }
+
+        var account = await _database.GetInternalXpAccountAsync(
+            guild.Id,
+            guildUser.Id);
+        var leaderboard = await _database.GetInternalXpLeaderboardAsync(guild.Id);
+        var xpByUser = leaderboard.ToDictionary(entry => entry.UserId);
+        var rankedUserIds = guild.Users
+            .Where(user => _options.Messages.RewardBots || !user.IsBot)
+            .Select(user => user.Id)
+            .OrderByDescending(userId => xpByUser.GetValueOrDefault(userId)?.TotalXp ?? 0)
+            .ThenBy(userId => userId)
+            .ToArray();
+        var rankIndex = Array.IndexOf(rankedUserIds, guildUser.Id);
+        var rank = rankIndex >= 0 ? rankIndex + 1 : rankedUserIds.Length + 1;
+
+        MemoryStream? avatarStream = null;
+        try
+        {
+            var avatarUrl = guildUser.GetDisplayAvatarUrl(ImageFormat.Png, 256);
+            var avatarBytes = await _httpClient.GetByteArrayAsync(avatarUrl, _runToken);
+            avatarStream = new MemoryStream(avatarBytes, writable: false);
+        }
+        catch (Exception exception)
+        {
+            await LogExceptionAsync($"RankAvatar:{guildUser.Id}", exception);
+        }
+
+        await using (avatarStream)
+        await using (var rankCard = _rankCardRenderer.Render(
+                         new RankCardData(
+                             guildUser.DisplayName,
+                             rank,
+                             account.CurrentLevel,
+                             account.CurrentLevelProgress,
+                             LevelCalculator.GetXpForNextLevel(account.CurrentLevel)),
+                         avatarStream))
+        {
+            await message.Channel.SendFileAsync(rankCard, "rank.png");
+        }
+    }
+
+    private async Task HandleInviteRecalculateCommandAsync(
+        SocketUserMessage message,
+        SocketGuild guild)
+    {
+        if (message.Author is not SocketGuildUser guildUser ||
+            !guildUser.GuildPermissions.ManageGuild)
+        {
+            await message.Channel.SendMessageAsync(
+                "You need the **Manage Server** permission to run " +
+                "`!recalculate-invites`.");
+            return;
+        }
+
+        if (!_options.InviteTracking.Enabled)
+        {
+            await message.Channel.SendMessageAsync("Invite tracking is disabled.");
+            return;
+        }
+
+        if (!await _inviteRecalculateGate.WaitAsync(0))
+        {
+            await message.Channel.SendMessageAsync(
+                "An invite recalculation is already running.");
+            return;
+        }
+
+        try
+        {
+            await message.Channel.SendMessageAsync(
+                "Invite recalculation started. Message and voice XP remain unchanged.");
+            var result = await BackfillInviteMembersFromDiscordCoreAsync();
+            var additionallyRewarded = await CheckDueInviteRewardsAsync();
+            await message.Channel.SendMessageAsync(
+                $"""
+                Invite recalculation finished.
+                **Matched members:** {result.MatchedMembers:N0}
+                **Newly imported:** {result.ImportedMembers:N0}
+                **Waiting for 7 days:** {result.PendingMembers:N0}
+                **Immediately rewarded:** {result.RewardedMembers:N0}
+                **Other due rewards:** {additionallyRewarded:N0}
+                **Awarded XP:** {result.AwardedXp:N0}
+                """);
+        }
+        finally
+        {
+            _inviteRecalculateGate.Release();
+        }
+    }
+
     private async Task OnMessageDeletedAsync(
         Cacheable<IMessage, ulong> message,
         Cacheable<IMessageChannel, ulong> channel)
     {
-        if (_options.Messages.ScanOnly ||
-            !_options.Messages.Enabled ||
+        if (!_options.Messages.Enabled ||
             !channel.HasValue ||
             channel.Value is not IGuildChannel guildChannel ||
             guildChannel.GuildId != _options.Discord.GuildId)
@@ -476,14 +722,30 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
         try
         {
-            var removed = await _database.RemoveMessageXpAsync(
-                guildChannel.Guild.Id,
-                message.Id);
-            if (_options.Debug.Enabled && removed)
+            await _liveMessageGate.WaitAsync();
+            try
             {
-                Console.WriteLine(
-                    $"[{DateTimeOffset.Now:O}] [DEBUG] [NACHRICHT-GELÖSCHT] " +
-                    $"Kanal={channel.Value.Name} ({channel.Id}) | Nachricht={message.Id}");
+                if (Volatile.Read(ref _messageRecalculationInProgress) == 1)
+                {
+                    _recalculateMessageBuffer.TryRemove(message.Id, out _);
+                    _recalculateDeletedMessageIds[message.Id] = 0;
+                    return;
+                }
+
+                var result = await _database.RemoveMessageXpAsync(
+                    guildChannel.Guild.Id,
+                    message.Id);
+                LogXpMovement(result.Movement);
+                if (_options.Debug.Enabled && result.Changed)
+                {
+                    Console.WriteLine(
+                        $"[{DateTimeOffset.Now:O}] [DEBUG] [NACHRICHT-GELÖSCHT] " +
+                        $"Kanal={channel.Value.Name} ({channel.Id}) | Nachricht={message.Id}");
+                }
+            }
+            finally
+            {
+                _liveMessageGate.Release();
             }
         }
         catch (Exception exception)
@@ -504,11 +766,6 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
     private async Task OnSlashCommandAsync(SocketSlashCommand command)
     {
-        if (_options.Messages.ScanOnly)
-        {
-            return;
-        }
-
         if (command.GuildId != _options.Discord.GuildId)
         {
             await command.RespondAsync("Dieser Bot ist für einen anderen Server konfiguriert.", ephemeral: true);
@@ -519,9 +776,6 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         {
             switch (command.Data.Name)
             {
-                case "xp-admin":
-                    await HandleAdminXpCommandAsync(command);
-                    break;
                 case "einladungen-nachbearbeiten":
                     await HandleInviteBackfillCommandAsync(command);
                     break;
@@ -540,44 +794,6 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                     ephemeral: true);
             }
         }
-    }
-
-    private async Task HandleAdminXpCommandAsync(SocketSlashCommand command)
-    {
-        if (command.User is not SocketGuildUser guildUser ||
-            !guildUser.GuildPermissions.ManageGuild)
-        {
-            await command.RespondAsync(
-                "Dafür brauchst du die Berechtigung „Server verwalten“.",
-                ephemeral: true);
-            return;
-        }
-
-        var user = command.Data.Options
-            .First(option => option.Name == "benutzer")
-            .Value as IUser;
-        var amount = Convert.ToInt32(
-            command.Data.Options.First(option => option.Name == "betrag").Value);
-        var reason = command.Data.Options
-            .FirstOrDefault(option => option.Name == "grund")
-            ?.Value?.ToString() ?? "manuelle Anpassung";
-
-        if (user is null || amount == 0)
-        {
-            await command.RespondAsync("Benutzer oder Betrag ist ungültig.", ephemeral: true);
-            return;
-        }
-
-        await _database.QueueManualXpCommandAsync(
-            _options.Discord.GuildId,
-            user.Id,
-            amount,
-            reason,
-            DateTimeOffset.UtcNow);
-        await DispatchPendingXpCommandsAsync();
-        await command.RespondAsync(
-            $"MEE6-Befehl für {user.Mention} mit **{amount:+#;-#;0} XP** vorgemerkt.",
-            ephemeral: true);
     }
 
     private async Task HandleInviteBackfillCommandAsync(SocketSlashCommand command)
@@ -628,30 +844,6 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             return;
         }
 
-        var admin = new SlashCommandBuilder()
-            .WithName("xp-admin")
-            .WithDescription("Sendet eine manuelle XP-Anpassung an MEE6.")
-            .WithDefaultMemberPermissions(GuildPermission.ManageGuild)
-            .AddOption(
-                "benutzer",
-                ApplicationCommandOptionType.User,
-                "Mitglied",
-                isRequired: true)
-            .AddOption(
-                "betrag",
-                ApplicationCommandOptionType.Integer,
-                "Positive oder negative XP",
-                isRequired: true,
-                minValue: -1_000_000,
-                maxValue: 1_000_000)
-            .AddOption(
-                "grund",
-                ApplicationCommandOptionType.String,
-                "Grund für die Anpassung",
-                isRequired: false,
-                maxLength: 200)
-            .Build();
-
         var backfill = new SlashCommandBuilder()
             .WithName("einladungen-nachbearbeiten")
             .WithDescription("Aktiviert die Verarbeitung alter, bereits in SQL gespeicherter Einladungen.")
@@ -664,7 +856,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             .WithDefaultMemberPermissions(GuildPermission.ManageGuild)
             .Build();
 
-        await _guild.BulkOverwriteApplicationCommandAsync([admin, backfill, xpList]);
+        await _guild.BulkOverwriteApplicationCommandAsync([backfill, xpList]);
         Console.WriteLine($"[{DateTimeOffset.Now:O}] Slash-Commands registriert.");
     }
 
@@ -770,6 +962,134 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         }
     }
 
+    private async Task<InviteMemberBackfillResult>
+        BackfillInviteMembersFromDiscordAsync()
+    {
+        await _inviteRecalculateGate.WaitAsync(_runToken);
+        try
+        {
+            return await BackfillInviteMembersFromDiscordCoreAsync();
+        }
+        finally
+        {
+            _inviteRecalculateGate.Release();
+        }
+    }
+
+    private async Task<InviteMemberBackfillResult>
+        BackfillInviteMembersFromDiscordCoreAsync()
+    {
+        if (_guild is null || !_options.InviteTracking.Enabled)
+        {
+            return InviteMemberBackfillResult.Empty;
+        }
+
+        var matchedMembers = new Dictionary<ulong, HistoricalInviteMember>();
+        var seenCursors = new HashSet<(ulong UserId, long JoinedAtUnixMilliseconds)>();
+        var properties = new MemberSearchPropertiesV2
+        {
+            Sort = MemberSearchV2SortType.MemberSinceOldestFirst,
+            OrQuery = new MemberSearchFilter
+            {
+                JoinSourceType = new MemberSearchIntQuery
+                {
+                    OrQuery = [(int)JoinSourceType.InviteCode]
+                }
+            }
+        };
+
+        while (true)
+        {
+            var page = await _guild.SearchUsersAsyncV2(1000, properties);
+            if (page.Members.Count == 0)
+            {
+                break;
+            }
+
+            foreach (var memberData in page.Members)
+            {
+                if (memberData.InviterId is not { } inviterId ||
+                    string.IsNullOrWhiteSpace(memberData.SourceInviteCode) ||
+                    memberData.User.JoinedAt is not { } joinedAt ||
+                    memberData.User.IsBot && !_options.InviteTracking.RewardBotInvites ||
+                    inviterId == memberData.User.Id &&
+                    !_options.InviteTracking.AllowSelfInvites)
+                {
+                    continue;
+                }
+
+                matchedMembers[memberData.User.Id] = new HistoricalInviteMember(
+                    memberData.User.Id,
+                    inviterId,
+                    memberData.SourceInviteCode,
+                    joinedAt);
+            }
+
+            var lastMember = page.Members.Last();
+            if (page.PageResultCount < 1000 ||
+                matchedMembers.Count >= page.TotalResultCount ||
+                lastMember.User.JoinedAt is not { } lastJoinedAt)
+            {
+                break;
+            }
+
+            var cursor = (
+                lastMember.User.Id,
+                lastJoinedAt.ToUnixTimeMilliseconds());
+            if (!seenCursors.Add(cursor))
+            {
+                Console.WriteLine(
+                    $"[{DateTimeOffset.Now:O}] [SCAN] INVITES WARNUNG | " +
+                    "Discord lieferte denselben Pagination-Cursor erneut.");
+                break;
+            }
+
+            properties.After = new MemberSearchPaginationFilter(
+                lastMember.User.Id,
+                lastJoinedAt);
+        }
+
+        Console.WriteLine(
+            $"[{DateTimeOffset.Now:O}] [SCAN] INVITES START | " +
+            $"Mitglieder mit Invite-Code und Einlader={matchedMembers.Count}");
+
+        var now = DateTimeOffset.UtcNow;
+        var result = await _database.BackfillInviteMembersAsync(
+            _guild.Id,
+            matchedMembers.Values.ToArray(),
+            now.AddDays(-_options.InviteTracking.RetentionDays),
+            _options.InviteTracking.RewardMinXp,
+            _options.InviteTracking.RewardMaxXp,
+            now);
+
+        foreach (var movement in result.Movements)
+        {
+            LogXpMovement(movement);
+        }
+
+        foreach (var userMovements in result.Movements.GroupBy(movement => movement.UserId))
+        {
+            var ordered = userMovements.ToArray();
+            var first = ordered[0];
+            var last = ordered[^1];
+            await NotifyLevelUpAsync(last with
+            {
+                Amount = ordered.Sum(movement => movement.Amount),
+                OldXp = first.OldXp,
+                OldLevel = first.OldLevel
+            });
+        }
+
+        Console.WriteLine(
+            $"[{DateTimeOffset.Now:O}] [SCAN] INVITES ENDE | " +
+            $"Bereits erfasst={result.AlreadyTrackedMembers} | " +
+            $"Neu importiert={result.ImportedMembers} | " +
+            $"Noch keine 7 Tage={result.PendingMembers} | " +
+            $"Vergütet={result.RewardedMembers} | " +
+            $"Vergebene XP={result.AwardedXp}");
+        return result;
+    }
+
     private async Task RunInviteRewardLoopAsync(CancellationToken cancellationToken)
     {
         using var timer = new PeriodicTimer(
@@ -810,18 +1130,23 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
                 if (member is null)
                 {
-                    await _database.RevokeInviteAndDeleteAsync(invite, DateTimeOffset.UtcNow);
+                    var removal = await _database.RevokeInviteAndDeleteAsync(
+                        invite,
+                        DateTimeOffset.UtcNow);
+                    LogXpMovement(removal.Movement);
                     continue;
                 }
 
-                var rewarded = await _database.MarkInviteRewardGivenAsync(
+                var movement = await _database.MarkInviteRewardGivenAsync(
                     invite,
                     DateTimeOffset.UtcNow);
-                if (!rewarded)
+                if (movement is null)
                 {
                     continue;
                 }
 
+                LogXpMovement(movement);
+                await NotifyLevelUpAsync(movement);
                 rewardCount++;
                 await AnnounceAsync(
                     _options.Announcements.AnnounceInviteRewards,
@@ -832,7 +1157,6 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                         invite.RewardXp));
             }
 
-            await DispatchPendingXpCommandsAsync();
         }
         catch (Exception exception)
         {
@@ -851,17 +1175,28 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         {
             while (await timer.WaitForNextTickAsync(cancellationToken))
             {
-                await CheckpointAllVoiceUsersAsync(
-                    _options.Announcements.AnnounceVoiceRewards);
+                try
+                {
+                    await CheckpointAllVoiceUsersAsync(
+                        _options.Announcements.AnnounceVoiceRewards);
+                }
+                catch (Exception exception)
+                {
+                    await LogExceptionAsync("VoiceCheckpointLoop", exception);
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // Normal shutdown.
         }
+        catch (Exception exception)
+        {
+            await LogExceptionAsync("VoiceCheckpointTimer", exception);
+        }
     }
 
-    private async Task ResetVoiceSessionsFromDiscordAsync()
+    private async Task SynchronizeVoiceSessionsFromDiscordAsync()
     {
         if (_guild is null)
         {
@@ -875,10 +1210,13 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             .Select(user => (user.Id, user.VoiceChannel!.Id))
             .ToArray();
 
-        await _database.ResetVoiceSessionsAsync(
+        var synchronizedUsers = await _database.SynchronizeVoiceSessionsAsync(
             _guild.Id,
             activeUsers,
             DateTimeOffset.UtcNow);
+        Console.WriteLine(
+            $"[{DateTimeOffset.Now:O}] Voice-Sitzungen synchronisiert: " +
+            $"{synchronizedUsers} aktive Benutzer.");
     }
 
     private async Task CheckpointAllVoiceUsersAsync(bool announce)
@@ -888,22 +1226,46 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             return;
         }
 
-        foreach (var user in _guild.Users.Where(user =>
-                     (!user.IsBot || _options.Voice.RewardBots) &&
-                     IsEligibleVoiceChannel(user.VoiceChannel)))
+        var activeUsers = _guild.Users.Where(user =>
+                (!user.IsBot || _options.Voice.RewardBots) &&
+                IsEligibleVoiceChannel(user.VoiceChannel))
+            .ToArray();
+
+        if (_options.Debug.Enabled)
+        {
+            Console.WriteLine(
+                $"[{DateTimeOffset.Now:O}] [DEBUG] [VOICE-CHECKPOINT] " +
+                $"Aktive Benutzer={activeUsers.Length}");
+        }
+
+        foreach (var user in activeUsers)
         {
             try
             {
+                var sessionRecovered = await _database.EnsureVoiceSessionAsync(
+                    _guild.Id,
+                    user.Id,
+                    user.VoiceChannel!.Id,
+                    DateTimeOffset.UtcNow);
+                if (sessionRecovered && _options.Debug.Enabled)
+                {
+                    Console.WriteLine(
+                        $"[{DateTimeOffset.Now:O}] [DEBUG] [VOICE-SITZUNG-ERSTELLT] " +
+                        $"Benutzer={user.DisplayName} ({user.Id}) | " +
+                        $"Kanal={user.VoiceChannel.Name} ({user.VoiceChannel.Id})");
+                }
+
                 var reward = await _database.RewardVoiceTimeAsync(
                     _guild.Id,
                     user.Id,
                     DateTimeOffset.UtcNow,
-                    _options.Voice.MinXpPerMinute,
-                    _options.Voice.MaxXpPerMinute,
-                    _options.Voice.MinimumRewardableMinutes,
+                    _options.Voice.MinXpPerFiveMinutes,
+                    _options.Voice.MaxXpPerFiveMinutes,
+                    _options.Voice.RewardBlockMinutes,
                     deleteSession: false);
 
-                await DispatchPendingXpCommandsAsync();
+                LogXpMovement(reward.Movement);
+                await NotifyLevelUpAsync(reward.Movement);
                 if (announce)
                 {
                     await AnnounceVoiceRewardAsync(user.Id, reward);
@@ -947,12 +1309,27 @@ public sealed class DiscordXpBotService : IAsyncDisposable
     private bool IsRewardableMessage(IMessage message)
     {
         return message.Source == MessageSource.User &&
+               _guild?.GetUser(message.Author.Id) is not null &&
+               !string.Equals(
+                   message.Content.Trim(),
+                   "!recalculate",
+                   StringComparison.OrdinalIgnoreCase) &&
+               !string.Equals(
+                   message.Content.Trim(),
+                   "!myrank",
+                   StringComparison.OrdinalIgnoreCase) &&
+               !string.Equals(
+                   message.Content.Trim(),
+                   "!recalculate-invites",
+                   StringComparison.OrdinalIgnoreCase) &&
                (_options.Messages.RewardBots || !message.Author.IsBot);
     }
 
-    private async Task ScanMessageHistoryAndPublishAsync(CancellationToken cancellationToken)
+    private async Task ScanMessageHistoryAndPublishAsync(
+        DateTimeOffset scanStartedAt,
+        CancellationToken cancellationToken)
     {
-        if (_guild is null || _mee6CommandChannel is null)
+        if (_guild is null || _botTextChannel is null)
         {
             return;
         }
@@ -966,7 +1343,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
             try
             {
-                statusMessage = await _mee6CommandChannel.SendMessageAsync(
+                statusMessage = await _botTextChannel.SendMessageAsync(
                     """
                     ## Nachrichten-Scan läuft …
                     Der Bot liest jetzt alle erreichbaren Nachrichten. Bei großen Kanälen kann das wegen Discord-Rate-Limits einige Zeit dauern.
@@ -974,7 +1351,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                     allowedMentions: AllowedMentions.None);
                 Console.WriteLine(
                     $"[{DateTimeOffset.Now:O}] Scan-Statusnachricht in " +
-                    $"#{_mee6CommandChannel.Name} ({_mee6CommandChannel.Id}) gesendet.");
+                    $"#{_botTextChannel.Name} ({_botTextChannel.Id}) gesendet.");
             }
             catch (Exception exception)
             {
@@ -987,6 +1364,8 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             var scannedChannels = 0;
             var skippedChannels = 0;
             var scannedChannelIds = new HashSet<ulong>();
+            var scannedMessageIds = new HashSet<ulong>();
+            var messageSnapshot = new List<MessageXpSnapshot>();
             var startedAt = DateTimeOffset.UtcNow;
             var lastStatusUpdate = DateTimeOffset.MinValue;
 
@@ -1025,7 +1404,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                             - Übersprungen: {skippedChannels:N0}
                             - Nachrichten geprüft: {currentScanned:N0}
                             - Gewertete User-Nachrichten: {currentRewardable:N0}
-                            - Beim Lauf neu in SQL: {currentInserted:N0}
+                            - Nachrichten im neuen Snapshot: {currentInserted:N0}
                             - Laufzeit: {elapsed:hh\:mm\:ss}
                             """;
                     });
@@ -1047,6 +1426,10 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 var result = await ScanMessageChannelAsync(
                     channel,
                     cancellationToken,
+                    messageSnapshot,
+                    scannedMessageIds,
+                    MessageScanPhase.Historical,
+                    scanStartedAt,
                     progress => UpdateStatusAsync($"#{channel.Name}", progress));
                 scannedMessages += result.Scanned;
                 rewardableMessages += result.Rewardable;
@@ -1070,6 +1453,10 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                         channel,
                         scannedChannelIds,
                         cancellationToken,
+                        messageSnapshot,
+                        scannedMessageIds,
+                        MessageScanPhase.Historical,
+                        scanStartedAt,
                         (threadName, progress) =>
                             UpdateStatusAsync($"Thread: {threadName}", progress));
                     scannedMessages += threadResult.Scanned;
@@ -1100,6 +1487,10 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                         forum,
                         scannedChannelIds,
                         cancellationToken,
+                        messageSnapshot,
+                        scannedMessageIds,
+                        MessageScanPhase.Historical,
+                        scanStartedAt,
                         (threadName, progress) =>
                             UpdateStatusAsync($"Forum-Thread: {threadName}", progress));
                     scannedMessages += threadResult.Scanned;
@@ -1119,10 +1510,143 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             }
 
             Console.WriteLine(
+                $"[{DateTimeOffset.Now:O}] [SCAN] CATCH-UP START | " +
+                $"Zeitpunkt={scanStartedAt:O}");
+            await UpdateStatusAsync(
+                "Historischer Scan fertig – neue Nachrichten werden nachgezogen",
+                force: true);
+
+            var catchUpThreadIds = new HashSet<ulong>();
+            foreach (var channel in _guild.TextChannels.OrderBy(channel => channel.Position))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var result = await ScanMessageChannelAsync(
+                    channel,
+                    cancellationToken,
+                    messageSnapshot,
+                    scannedMessageIds,
+                    MessageScanPhase.CatchUp,
+                    scanStartedAt,
+                    progress => UpdateStatusAsync(
+                        $"Nachziehen: #{channel.Name}",
+                        progress));
+                scannedMessages += result.Scanned;
+                rewardableMessages += result.Rewardable;
+                newXpMessages += result.Inserted;
+
+                if (_options.Messages.IncludeThreads && channel is not IVoiceChannel)
+                {
+                    var threadResult = await ScanThreadsAsync(
+                        channel,
+                        catchUpThreadIds,
+                        cancellationToken,
+                        messageSnapshot,
+                        scannedMessageIds,
+                        MessageScanPhase.CatchUp,
+                        scanStartedAt,
+                        (threadName, progress) =>
+                            UpdateStatusAsync(
+                                $"Nachziehen, Thread: {threadName}",
+                                progress));
+                    scannedMessages += threadResult.Scanned;
+                    rewardableMessages += threadResult.Rewardable;
+                    newXpMessages += threadResult.Inserted;
+                }
+            }
+
+            if (_options.Messages.IncludeThreads)
+            {
+                foreach (var forum in _guild.ForumChannels)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var threadResult = await ScanThreadsAsync(
+                        forum,
+                        catchUpThreadIds,
+                        cancellationToken,
+                        messageSnapshot,
+                        scannedMessageIds,
+                        MessageScanPhase.CatchUp,
+                        scanStartedAt,
+                        (threadName, progress) =>
+                            UpdateStatusAsync(
+                                $"Nachziehen, Forum-Thread: {threadName}",
+                                progress));
+                    scannedMessages += threadResult.Scanned;
+                    rewardableMessages += threadResult.Rewardable;
+                    newXpMessages += threadResult.Inserted;
+                }
+            }
+
+            Console.WriteLine(
+                $"[{DateTimeOffset.Now:O}] [SCAN] CATCH-UP ENDE | " +
+                $"Snapshot={messageSnapshot.Count}");
+
+            Console.WriteLine(
                 $"[{DateTimeOffset.Now:O}] Nachrichten-XP: Scan beendet. " +
                 $"{scannedChannels} Kanäle/Threads gelesen, {skippedChannels} übersprungen, " +
                 $"{scannedMessages} Nachrichten geprüft, {rewardableMessages} User-Nachrichten, " +
-                $"{newXpMessages} erstmals verbucht.");
+                $"{newXpMessages} im neuen Nachrichten-Snapshot.");
+
+            Console.WriteLine(
+                $"[{DateTimeOffset.Now:O}] [SCAN] SQL REPLACE START | " +
+                $"MessageSnapshot={messageSnapshot.Count}");
+            IReadOnlyList<XpMovementResult> movements;
+            await _liveMessageGate.WaitAsync(cancellationToken);
+            try
+            {
+                var finalSnapshot = messageSnapshot.ToDictionary(
+                    message => message.MessageId);
+                foreach (var bufferedMessage in _recalculateMessageBuffer.Values)
+                {
+                    finalSnapshot[bufferedMessage.MessageId] = bufferedMessage;
+                }
+
+                foreach (var deletedMessageId in _recalculateDeletedMessageIds.Keys)
+                {
+                    finalSnapshot.Remove(deletedMessageId);
+                }
+
+                movements = await _database.ReplaceMessageXpAsync(
+                    _guild.Id,
+                    finalSnapshot.Values.ToArray(),
+                    DateTimeOffset.UtcNow);
+                _recalculateMessageBuffer.Clear();
+                _recalculateDeletedMessageIds.Clear();
+                Interlocked.Exchange(ref _messageRecalculationInProgress, 0);
+            }
+            finally
+            {
+                _liveMessageGate.Release();
+            }
+            Console.WriteLine(
+                $"[{DateTimeOffset.Now:O}] [SCAN] SQL REPLACE ENDE | " +
+                $"Benutzer aktualisiert={movements.Count}");
+            foreach (var movement in movements.Where(movement => movement.LeveledUp))
+            {
+                await NotifyLevelUpAsync(movement);
+            }
+            foreach (var movement in movements)
+            {
+                LogXpMovement(movement);
+            }
+
+            var inviteBackfill = InviteMemberBackfillResult.Empty;
+            string? inviteBackfillError = null;
+            if (_options.InviteTracking.Enabled)
+            {
+                await UpdateStatusAsync(
+                    "Verfügbare Discord-Einladungen werden nachberechnet",
+                    force: true);
+                try
+                {
+                    inviteBackfill = await BackfillInviteMembersFromDiscordAsync();
+                }
+                catch (Exception exception)
+                {
+                    inviteBackfillError = exception.Message;
+                    await LogExceptionAsync("InviteUsageBackfill", exception);
+                }
+            }
 
             if (_options.Messages.PublishLeaderboardAfterScan)
             {
@@ -1134,7 +1658,13 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                     skippedChannels,
                     scannedMessages,
                     rewardableMessages,
-                    newXpMessages),
+                    newXpMessages,
+                    inviteBackfill.MatchedMembers,
+                    inviteBackfill.ImportedMembers,
+                    inviteBackfill.PendingMembers,
+                    inviteBackfill.RewardedMembers,
+                    inviteBackfill.AwardedXp,
+                    inviteBackfillError),
                     statusMessage);
                 Console.WriteLine(
                     $"[{DateTimeOffset.Now:O}] [SCAN] ERGEBNIS ENDE | " +
@@ -1166,7 +1696,55 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         }
         finally
         {
+            if (Interlocked.Exchange(ref _messageRecalculationInProgress, 0) == 1)
+            {
+                await FlushBufferedLiveMessagesAsync();
+            }
+
             _messageScanGate.Release();
+        }
+    }
+
+    private async Task FlushBufferedLiveMessagesAsync()
+    {
+        if (_guild is null)
+        {
+            return;
+        }
+
+        await _liveMessageGate.WaitAsync();
+        try
+        {
+            foreach (var message in _recalculateMessageBuffer.Values)
+            {
+                if (_recalculateDeletedMessageIds.ContainsKey(message.MessageId))
+                {
+                    continue;
+                }
+
+                var result = await _database.RegisterMessageXpAsync(
+                    _guild.Id,
+                    message.ChannelId,
+                    message.MessageId,
+                    message.UserId,
+                    message.Xp,
+                    message.CreatedAtUtc);
+                LogXpMovement(result.Movement);
+                await NotifyLevelUpAsync(result.Movement);
+            }
+
+            foreach (var messageId in _recalculateDeletedMessageIds.Keys)
+            {
+                var result = await _database.RemoveMessageXpAsync(_guild.Id, messageId);
+                LogXpMovement(result.Movement);
+            }
+
+            _recalculateMessageBuffer.Clear();
+            _recalculateDeletedMessageIds.Clear();
+        }
+        finally
+        {
+            _liveMessageGate.Release();
         }
     }
 
@@ -1174,6 +1752,10 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         IThreadContainerChannel container,
         HashSet<ulong> scannedChannelIds,
         CancellationToken cancellationToken,
+        List<MessageXpSnapshot> messageSnapshot,
+        HashSet<ulong> scannedMessageIds,
+        MessageScanPhase phase,
+        DateTimeOffset scanStartedAt,
         Func<string, MessageChannelProgress, Task>? progressCallback = null)
     {
         var result = MessageScanResult.Empty;
@@ -1192,6 +1774,10 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                     result += await ScanMessageChannelAsync(
                         thread,
                         cancellationToken,
+                        messageSnapshot,
+                        scannedMessageIds,
+                        phase,
+                        scanStartedAt,
                         progress => progressCallback?.Invoke(thread.Name, progress) ??
                                     Task.CompletedTask);
                 }
@@ -1217,6 +1803,10 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                         result += await ScanMessageChannelAsync(
                             thread,
                             cancellationToken,
+                            messageSnapshot,
+                            scannedMessageIds,
+                            phase,
+                            scanStartedAt,
                             progress => progressCallback?.Invoke(thread.Name, progress) ??
                                         Task.CompletedTask);
                     }
@@ -1270,6 +1860,10 @@ public sealed class DiscordXpBotService : IAsyncDisposable
     private async Task<MessageScanResult> ScanMessageChannelAsync(
         IMessageChannel channel,
         CancellationToken cancellationToken,
+        List<MessageXpSnapshot> messageSnapshot,
+        HashSet<ulong> scannedMessageIds,
+        MessageScanPhase phase,
+        DateTimeOffset scanStartedAt,
         Func<MessageChannelProgress, Task>? progressCallback = null)
     {
         var scanned = 0;
@@ -1312,9 +1906,24 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                     break;
                 }
 
+                var reachedCatchUpBoundary = false;
                 foreach (var message in messages)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+
+                    if (phase == MessageScanPhase.Historical &&
+                        message.Timestamp >= scanStartedAt)
+                    {
+                        continue;
+                    }
+
+                    if (phase == MessageScanPhase.CatchUp &&
+                        message.Timestamp < scanStartedAt)
+                    {
+                        reachedCatchUpBoundary = true;
+                        continue;
+                    }
+
                     scanned++;
                     if (!IsRewardableMessage(message))
                     {
@@ -1326,14 +1935,14 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                         message.Id,
                         _options.Messages.MinXp,
                         _options.Messages.MaxXp);
-                    if (await _database.RegisterMessageXpAsync(
-                            _options.Discord.GuildId,
+                    if (scannedMessageIds.Add(message.Id))
+                    {
+                        messageSnapshot.Add(new MessageXpSnapshot(
                             channel.Id,
                             message.Id,
                             message.Author.Id,
                             xp,
-                            message.Timestamp))
-                    {
+                            message.Timestamp));
                         inserted++;
                     }
                 }
@@ -1348,12 +1957,14 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
                 Console.WriteLine(
                     $"[{DateTimeOffset.Now:O}] [SCAN] BATCH FERTIG | " +
-                    $"Kanal=#{channel.Name} | Batch={batchNumber} | " +
+                    $"Phase={phase} | Kanal=#{channel.Name} | Batch={batchNumber} | " +
                     $"Geladen={messages.Length} | GesamtGeprüft={scanned} | " +
                     $"User-Nachrichten={rewardable} | Neu={inserted}");
 
                 var nextBeforeMessageId = messages.Min(message => message.Id);
-                if (messages.Length < 100 || nextBeforeMessageId == beforeMessageId)
+                if (reachedCatchUpBoundary ||
+                    messages.Length < 100 ||
+                    nextBeforeMessageId == beforeMessageId)
                 {
                     break;
                 }
@@ -1395,7 +2006,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         MessageScanSummary? scanSummary = null,
         IUserMessage? statusMessage = null)
     {
-        if (_guild is null || _mee6CommandChannel is null)
+        if (_guild is null || _botTextChannel is null)
         {
             return;
         }
@@ -1405,21 +2016,20 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             $"[{DateTimeOffset.Now:O}] [SCAN] RANGLISTE DATEN | " +
             $"SQL-Einträge={databaseEntries.Count} | Server-Mitglieder={_guild.Users.Count}");
         var entriesByUser = databaseEntries.ToDictionary(entry => entry.UserId);
-        var userIds = _guild.Users
+        var currentMemberEntries = _guild.Users
             .Where(user => _options.Messages.RewardBots || !user.IsBot)
             .Select(user => user.Id)
-            .Union(entriesByUser.Keys)
             .Distinct()
             .Select(userId => entriesByUser.GetValueOrDefault(userId) ??
-                              new InternalXpEntry(userId, 0, 0, 0))
+                              new InternalXpEntry(userId, 0, 0, 0, 0, 0, 0, 0))
             .OrderByDescending(entry => entry.TotalXp)
             .ThenBy(entry => entry.UserId)
             .ToArray();
 
-        var pages = BuildLeaderboardPages(userIds);
+        var pages = BuildLeaderboardPages(currentMemberEntries);
         Console.WriteLine(
             $"[{DateTimeOffset.Now:O}] [SCAN] RANGLISTE SEITEN | " +
-            $"Benutzer={userIds.Length} | Seiten={pages.Count}");
+            $"Benutzer={currentMemberEntries.Length} | Seiten={pages.Count}");
         for (var index = 0; index < pages.Count; index++)
         {
             var pageHeader = pages.Count == 1
@@ -1432,7 +2042,17 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                    - Kanäle/Threads übersprungen: {scanSummary.ChannelsSkipped:N0}
                    - Nachrichten geprüft: {scanSummary.MessagesScanned:N0}
                    - Gewertete User-Nachrichten: {scanSummary.RewardableMessages:N0}
-                   - Beim Lauf neu in SQL: {scanSummary.NewMessages:N0}
+                   - Nachrichten im gespeicherten Snapshot: {scanSummary.NewMessages:N0}
+                   - Mitglieder mit Invite-Code und Einlader: {scanSummary.MatchedInviteMembers:N0}
+                   - Neu als Einladung importiert: {scanSummary.ImportedInviteMembers:N0}
+                   - Davon noch keine 7 Tage auf dem Server: {scanSummary.PendingInviteMembers:N0}
+                   - Sofort vergütete Einladungen: {scanSummary.RewardedInviteMembers:N0}
+                   - Neu vergebene Invite-XP: {scanSummary.InviteXpAwarded:N0}
+                   {(
+                       string.IsNullOrWhiteSpace(scanSummary.InviteBackfillError)
+                           ? string.Empty
+                           : $"- Invite-Nachberechnung fehlgeschlagen: {scanSummary.InviteBackfillError}\n"
+                   )}
 
                    """
                 : string.Empty;
@@ -1459,8 +2079,8 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
             Console.WriteLine(
                 $"[{DateTimeOffset.Now:O}] [SCAN] DISCORD SENDEN | " +
-                $"Seite={index + 1}/{pages.Count} | Kanal=#{_mee6CommandChannel.Name}");
-            await _mee6CommandChannel.SendMessageAsync(
+                $"Seite={index + 1}/{pages.Count} | Kanal=#{_botTextChannel.Name}");
+            await _botTextChannel.SendMessageAsync(
                 content,
                 allowedMentions: AllowedMentions.None);
         }
@@ -1476,8 +2096,12 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         {
             var entry = entries[index];
             var line =
-                $"{index + 1}. <@{entry.UserId}> — **{entry.TotalXp:N0} XP** " +
-                $"(Nachrichten: {entry.MessageXp:N0} XP / {entry.MessageCount:N0})\n";
+                $"{index + 1}. <@{entry.UserId}> — **Level {entry.CurrentLevel}** | " +
+                $"**{entry.TotalXp:N0} XP** | Fortschritt: " +
+                $"{entry.CurrentLevelProgress:N0}/" +
+                $"{LevelCalculator.GetXpForNextLevel(entry.CurrentLevel):N0} | " +
+                $"Text: {entry.MessageXp:N0} | Voice: {entry.VoiceXp:N0} | " +
+                $"Invites: {entry.InviteXp:N0} | Nachrichten: {entry.MessageCount:N0}\n";
 
             if (current.Length > 0 && current.Length + line.Length > 1450)
             {
@@ -1501,15 +2125,15 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         return pages;
     }
 
-    private async Task<ITextChannel> GetOrCreateMee6CommandChannelAsync()
+    private async Task<ITextChannel> GetOrCreateBotTextChannelAsync()
     {
         if (_guild is null)
         {
             throw new InvalidOperationException("Der Discord-Server ist noch nicht geladen.");
         }
 
-        if (_options.Mee6Commands.ChannelId != 0 &&
-            _guild.GetTextChannel(_options.Mee6Commands.ChannelId) is { } configuredChannel)
+        if (_options.BotChannel.ChannelId != 0 &&
+            _guild.GetTextChannel(_options.BotChannel.ChannelId) is { } configuredChannel)
         {
             return configuredChannel;
         }
@@ -1517,112 +2141,120 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         var existingChannel = _guild.TextChannels.FirstOrDefault(channel =>
             string.Equals(
                 channel.Name,
-                _options.Mee6Commands.ChannelName,
+                _options.BotChannel.ChannelName,
                 StringComparison.OrdinalIgnoreCase));
         if (existingChannel is not null)
         {
             return existingChannel;
         }
 
-        if (!_options.Mee6Commands.CreateChannelIfMissing)
+        if (!_options.BotChannel.CreateChannelIfMissing)
         {
             throw new InvalidOperationException(
-                "Der konfigurierte MEE6-Befehlskanal wurde nicht gefunden.");
+                "Der konfigurierte Bot-Textkanal wurde nicht gefunden.");
         }
 
         var createdChannel = await _guild.CreateTextChannelAsync(
-            _options.Mee6Commands.ChannelName,
+            _options.BotChannel.ChannelName,
             properties =>
             {
                 properties.Topic =
-                    "Automatische XP-Befehle und interne XP-Auswertungen. Nicht für normale Nachrichten verwenden.";
-                if (_options.Mee6Commands.CategoryId != 0)
+                    "Statusmeldungen, Scan-Fortschritt und interne XP-Auswertungen des Bots.";
+                if (_options.BotChannel.CategoryId != 0)
                 {
-                    properties.CategoryId = _options.Mee6Commands.CategoryId;
+                    properties.CategoryId = _options.BotChannel.CategoryId;
                 }
             });
 
         Console.WriteLine(
-            $"[{DateTimeOffset.Now:O}] MEE6-Befehlskanal #{createdChannel.Name} erstellt.");
+            $"[{DateTimeOffset.Now:O}] Bot-Textkanal #{createdChannel.Name} erstellt.");
         return createdChannel;
     }
 
-    private async Task RunXpDispatchLoopAsync(CancellationToken cancellationToken)
+    private async Task<ITextChannel?> GetOrCreateLevelUpChannelAsync()
     {
-        using var timer = new PeriodicTimer(
-            TimeSpan.FromSeconds(_options.Mee6Commands.DispatchIntervalSeconds));
+        if (_guild is null || !_options.Levels.Enabled)
+        {
+            return null;
+        }
 
-        try
+        if (_options.Levels.LevelUpChannelId != 0 &&
+            _guild.GetTextChannel(_options.Levels.LevelUpChannelId) is { } configuredChannel)
         {
-            while (await timer.WaitForNextTickAsync(cancellationToken))
+            return configuredChannel;
+        }
+
+        var existingChannel = _guild.TextChannels.FirstOrDefault(channel =>
+            string.Equals(
+                channel.Name,
+                _options.Levels.LevelUpChannelName,
+                StringComparison.OrdinalIgnoreCase));
+        if (existingChannel is not null)
+        {
+            return existingChannel;
+        }
+
+        if (!_options.Levels.CreateChannelIfMissing)
+        {
+            Console.WriteLine(
+                $"[{DateTimeOffset.Now:O}] Level-up channel was not found. " +
+                "Level-up notifications are disabled.");
+            return null;
+        }
+
+        var createdChannel = await _guild.CreateTextChannelAsync(
+            _options.Levels.LevelUpChannelName,
+            properties =>
             {
-                await DispatchPendingXpCommandsAsync();
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            // Normal shutdown.
-        }
+                properties.Topic = "Automatic level-up notifications.";
+                if (_options.Levels.CategoryId != 0)
+                {
+                    properties.CategoryId = _options.Levels.CategoryId;
+                }
+            });
+
+        Console.WriteLine(
+            $"[{DateTimeOffset.Now:O}] Level-up channel #{createdChannel.Name} created.");
+        return createdChannel;
     }
 
-    private async Task DispatchPendingXpCommandsAsync()
+    private async Task NotifyLevelUpAsync(XpMovementResult? movement)
     {
-        if (!_options.Mee6Commands.Enabled ||
-            _mee6CommandChannel is null ||
-            _guild is null)
+        if (!_options.Levels.Enabled ||
+            _levelUpChannel is null ||
+            movement is null ||
+            !movement.LeveledUp)
         {
             return;
         }
 
-        if (!await _xpDispatchGate.WaitAsync(0))
+        await _levelUpChannel.SendMessageAsync(
+            $"""
+            🎉 <@{movement.UserId}> leveled up!
+            **Level:** {movement.OldLevel} → {movement.NewLevel}
+            **Total XP:** {movement.NewXp:N0}
+            **Level progress:** {movement.CurrentLevelProgress:N0}/{movement.XpForNextLevel:N0}
+            **XP needed for next level:** {Math.Max(
+                0,
+                movement.XpForNextLevel - movement.CurrentLevelProgress):N0}
+            """);
+    }
+
+    private void LogXpMovement(XpMovementResult? movement)
+    {
+        if (!_options.Debug.Enabled ||
+            movement is null ||
+            !movement.Applied ||
+            movement.Amount == 0)
         {
             return;
         }
 
-        try
-        {
-            var pending = await _database.GetPendingXpDispatchesAsync(_guild.Id);
-            foreach (var dispatch in pending)
-            {
-                if (!await _database.TryClaimXpDispatchAsync(dispatch.Id, DateTimeOffset.UtcNow))
-                {
-                    continue;
-                }
-
-                try
-                {
-                    var template = dispatch.Amount >= 0
-                        ? _options.Mee6Commands.GiveXpCommand
-                        : _options.Mee6Commands.RemoveXpCommand;
-                    var commandText = FormatMee6Command(
-                        template,
-                        dispatch.UserId,
-                        Math.Abs(dispatch.Amount));
-                    var message = await _mee6CommandChannel.SendMessageAsync(commandText);
-                    await _database.MarkXpDispatchSentAsync(
-                        dispatch.Id,
-                        message.Id,
-                        DateTimeOffset.UtcNow);
-                }
-                catch (Exception exception)
-                {
-                    await _database.MarkXpDispatchFailedAsync(dispatch.Id, exception.Message);
-                    await LogExceptionAsync($"Mee6Dispatch:{dispatch.ReferenceId}", exception);
-                }
-            }
-        }
-        finally
-        {
-            _xpDispatchGate.Release();
-        }
-    }
-
-    private static string FormatMee6Command(string template, ulong userId, int xp)
-    {
-        return template
-            .Replace("{user}", $"<@{userId}>", StringComparison.OrdinalIgnoreCase)
-            .Replace("{userId}", userId.ToString(), StringComparison.OrdinalIgnoreCase)
-            .Replace("{xp}", xp.ToString(), StringComparison.OrdinalIgnoreCase);
+        Console.WriteLine(
+            $"[{DateTimeOffset.Now:O}] [DEBUG] [XP] " +
+            $"User={movement.UserId} | Amount={movement.Amount:+#;-#;0} | " +
+            $"Reason={movement.Reason} | XP={movement.OldXp}->{movement.NewXp} | " +
+            $"Level={movement.OldLevel}->{movement.NewLevel}");
     }
 
     private async Task AnnounceAsync(bool featureEnabled, string message)
@@ -1687,9 +2319,11 @@ public sealed class DiscordXpBotService : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await _client.DisposeAsync();
+        _httpClient.Dispose();
         _inviteGate.Dispose();
-        _xpDispatchGate.Dispose();
+        _inviteRecalculateGate.Dispose();
         _messageScanGate.Dispose();
+        _liveMessageGate.Dispose();
     }
 
     private sealed record InviteSnapshot(int Uses, ulong? InviterId);
@@ -1719,10 +2353,22 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         int ChannelsSkipped,
         int MessagesScanned,
         int RewardableMessages,
-        int NewMessages);
+        int NewMessages,
+        int MatchedInviteMembers,
+        int ImportedInviteMembers,
+        int PendingInviteMembers,
+        int RewardedInviteMembers,
+        int InviteXpAwarded,
+        string? InviteBackfillError);
 
     private sealed record MessageChannelProgress(
         int Scanned,
         int Rewardable,
         int Inserted);
+
+    private enum MessageScanPhase
+    {
+        Historical,
+        CatchUp
+    }
 }

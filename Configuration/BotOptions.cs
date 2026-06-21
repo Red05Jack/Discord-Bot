@@ -8,8 +8,9 @@ public sealed class BotOptions
     public InviteTrackingOptions InviteTracking { get; set; } = new();
     public VoiceXpOptions Voice { get; set; } = new();
     public MessageXpOptions Messages { get; set; } = new();
+    public LevelSystemOptions Levels { get; set; } = new();
     public XpOptions Xp { get; set; } = new();
-    public Mee6CommandOptions Mee6Commands { get; set; } = new();
+    public BotChannelOptions BotChannel { get; set; } = new();
     public AnnouncementOptions Announcements { get; set; } = new();
     public DebugOptions Debug { get; set; } = new();
 
@@ -74,10 +75,10 @@ public sealed class BotOptions
             "InviteTracking.RewardMinXp",
             "InviteTracking.RewardMaxXp");
         ValidateRange(
-            Voice.MinXpPerMinute,
-            Voice.MaxXpPerMinute,
-            "Voice.MinXpPerMinute",
-            "Voice.MaxXpPerMinute");
+            Voice.MinXpPerFiveMinutes,
+            Voice.MaxXpPerFiveMinutes,
+            "Voice.MinXpPerFiveMinutes",
+            "Voice.MaxXpPerFiveMinutes");
         ValidateRange(
             Messages.MinXp,
             Messages.MaxXp,
@@ -101,29 +102,28 @@ public sealed class BotOptions
                 "Voice.CheckpointIntervalMinutes muss größer als 0 sein.");
         }
 
-        if (Voice.MinimumRewardableMinutes <= 0)
+        if (Voice.RewardBlockMinutes <= 0)
         {
             throw new InvalidOperationException(
-                "Voice.MinimumRewardableMinutes muss größer als 0 sein.");
+                "Voice.RewardBlockMinutes muss größer als 0 sein.");
         }
 
-        if (Mee6Commands.Enabled)
+        if (BotChannel.Enabled)
         {
-            if (Mee6Commands.ChannelId == 0 &&
-                string.IsNullOrWhiteSpace(Mee6Commands.ChannelName))
+            if (BotChannel.ChannelId == 0 &&
+                string.IsNullOrWhiteSpace(BotChannel.ChannelName))
             {
                 throw new InvalidOperationException(
-                    "Mee6Commands.ChannelName muss gesetzt sein, wenn keine ChannelId angegeben ist.");
+                    "BotChannel.ChannelName muss gesetzt sein, wenn keine ChannelId angegeben ist.");
             }
+        }
 
-            ValidateCommandTemplate(Mee6Commands.GiveXpCommand, "Mee6Commands.GiveXpCommand");
-            ValidateCommandTemplate(Mee6Commands.RemoveXpCommand, "Mee6Commands.RemoveXpCommand");
-
-            if (Mee6Commands.DispatchIntervalSeconds <= 0)
-            {
-                throw new InvalidOperationException(
-                    "Mee6Commands.DispatchIntervalSeconds muss größer als 0 sein.");
-            }
+        if (Levels.Enabled &&
+            Levels.LevelUpChannelId == 0 &&
+            string.IsNullOrWhiteSpace(Levels.LevelUpChannelName))
+        {
+            throw new InvalidOperationException(
+                "Levels.LevelUpChannelName must be set when no LevelUpChannelId is configured.");
         }
     }
 
@@ -136,16 +136,6 @@ public sealed class BotOptions
         }
     }
 
-    private static void ValidateCommandTemplate(string template, string name)
-    {
-        if (string.IsNullOrWhiteSpace(template) ||
-            !template.Contains("{user}", StringComparison.OrdinalIgnoreCase) ||
-            !template.Contains("{xp}", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidOperationException(
-                $"{name} muss die Platzhalter {{user}} und {{xp}} enthalten.");
-        }
-    }
 }
 
 public sealed class DiscordOptions
@@ -169,9 +159,9 @@ public sealed class InviteTrackingOptions
 public sealed class VoiceXpOptions
 {
     public bool Enabled { get; set; }
-    public int MinXpPerMinute { get; set; }
-    public int MaxXpPerMinute { get; set; }
-    public int MinimumRewardableMinutes { get; set; } = 5;
+    public int MinXpPerFiveMinutes { get; set; } = 5;
+    public int MaxXpPerFiveMinutes { get; set; } = 15;
+    public int RewardBlockMinutes { get; set; } = 5;
     public double CheckpointIntervalMinutes { get; set; }
     public bool RewardBots { get; set; }
     public List<ulong> EligibleChannelIds { get; set; } = [];
@@ -181,11 +171,9 @@ public sealed class VoiceXpOptions
 public sealed class MessageXpOptions
 {
     public bool Enabled { get; set; } = true;
-    public bool ScanOnly { get; set; } = true;
     public int MinXp { get; set; } = 15;
     public int MaxXp { get; set; } = 25;
     public bool RewardBots { get; set; }
-    public bool ScanHistoryOnStartup { get; set; } = true;
     public bool IncludeThreads { get; set; } = true;
     public bool PublishLeaderboardAfterScan { get; set; } = true;
 }
@@ -195,16 +183,22 @@ public sealed class XpOptions
     public string DatabasePath { get; set; } = string.Empty;
 }
 
-public sealed class Mee6CommandOptions
+public sealed class LevelSystemOptions
 {
-    public bool Enabled { get; set; }
+    public bool Enabled { get; set; } = true;
+    public ulong LevelUpChannelId { get; set; }
+    public string LevelUpChannelName { get; set; } = "level-ups";
+    public ulong CategoryId { get; set; }
+    public bool CreateChannelIfMissing { get; set; } = true;
+}
+
+public sealed class BotChannelOptions
+{
+    public bool Enabled { get; set; } = true;
     public ulong ChannelId { get; set; }
     public string ChannelName { get; set; } = "mee6-xp-befehle";
     public ulong CategoryId { get; set; }
-    public bool CreateChannelIfMissing { get; set; }
-    public string GiveXpCommand { get; set; } = "!give-xp {user} {xp}";
-    public string RemoveXpCommand { get; set; } = "!remove-xp {user} {xp}";
-    public double DispatchIntervalSeconds { get; set; } = 5;
+    public bool CreateChannelIfMissing { get; set; } = true;
 }
 
 public sealed class AnnouncementOptions

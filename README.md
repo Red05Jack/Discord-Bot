@@ -1,151 +1,190 @@
 # Discord XP Bot (C#)
 
-Der Bot verwaltet:
+Der Bot verwaltet ein eigenes, dauerhaftes XP- und Levelsystem für:
 
-- interne XP-Konten mit einem eindeutigen Ledger für Nachrichten, Voice und Einladungen;
-- 15–25 deterministische XP pro Nachricht;
-- zufällige Invite-XP, sobald das eingeladene Mitglied die konfigurierte Haltezeit erreicht;
-- eine vollständige Rückbuchung, wenn das eingeladene Mitglied später den Server verlässt;
-- zufällige XP pro vollständiger Voice-Minute nach mindestens fünf Minuten im selben Voice-Chat;
-- persistente Invite-Deduplizierung, MEE6-Versandaufträge und Voice-Sitzungen in SQLite;
-- einen eigenen Discord-Kanal für konfigurierbare `!give-xp`- und `!remove-xp`-Nachrichten.
+- Textnachrichten;
+- Voice-Zeit;
+- Einladungen.
 
-Alle XP-Werte, Zeiträume, Voice-Kanäle, Befehlsvorlagen und weitere Schalter stehen in
-`appsettings.json`.
+Alle XP-Werte, Zeiträume, Kanäle und Schalter stehen in `appsettings.json`. Die Daten
+werden in SQLite gespeichert und bleiben nach einem Neustart erhalten.
 
-## Wichtiger Hinweis zu MEE6
+## XP-Konten und Level
 
-MEE6 stellt keine öffentliche Schreib-API bereit, mit der ein fremder Bot XP vergeben oder
-entfernen kann. Dieses Projekt sendet wie gewünscht konfigurierbare `!`-Nachrichten in einen
-eigenen Kanal. Der offizielle MEE6-Bot ignoriert jedoch normalerweise Nachrichten anderer
-Bots. Ob diese Nachrichten tatsächlich XP bei MEE6 verändern, hängt daher von deiner
-MEE6-/Server-Konfiguration ab. Ein User-Token oder Self-Bot wird bewusst nicht verwendet.
+Jeder Benutzer besitzt drei getrennte XP-Werte:
 
-Jede geplante XP-Änderung wird vor dem Senden eindeutig in `xp_dispatches` gespeichert.
-Invite-Auszahlungen und Rückbuchungen bleiben zusätzlich dauerhaft in
-`invite_xp_ledger`. Derselbe Invite-Reward kann dadurch nicht ein zweites Mal erzeugt werden.
+- `MessageXp`
+- `VoiceXp`
+- `InviteXp`
 
-Das interne XP-System führt alle Quellen zusammen. MEE6-Befehle für Voice und Einladungen
-bleiben zusätzlich bestehen, sind aber nicht die Datenquelle der internen XP-Liste.
+`TotalXp` ist immer die Summe dieser drei Werte. Ein Benutzer startet mit 0 XP auf Level 0.
+Die benötigten XP für das nächste Level werden so berechnet:
+
+```text
+round(20.0 * (currentLevel + 1)^1.9)
+```
+
+Große Gutschriften können mehrere Level auf einmal auslösen. Abzüge können das Level wieder
+senken, XP werden aber nie kleiner als 0. Jede tatsächliche XP-Bewegung wird mit Benutzer,
+Betrag, Grund, Zeitpunkt, alten/neuen XP und altem/neuem Level in SQLite protokolliert.
+
+Bei einem Level-Up sendet der Bot eine Nachricht in den unter `Levels` konfigurierten Kanal.
 
 ## Nachrichten-XP
 
-Jede normale User-Nachricht erhält zwischen 15 und 25 XP. Der Wert wird ausschließlich aus
-der Discord-Nachrichten-ID mit einer festen SplitMix64-Formel berechnet. Deshalb liefert
-dieselbe Message-ID immer denselben XP-Wert und kann durch den eindeutigen SQL-Schlüssel nur
-einmal verbucht werden.
+Jede normale neue User-Nachricht erhält deterministisch 15 bis 25 XP. Die XP werden aus der
+Discord-Nachrichten-ID berechnet. Dieselbe ID ergibt daher immer denselben Wert und wird durch
+den eindeutigen Datenbankschlüssel nur einmal verbucht.
 
-Beim Start liest der Bot standardmäßig alle erreichbaren Nachrichten in Textkanälen,
-öffentlichen archivierten Threads und aktiven Threads ein. Danach werden neue Nachrichten
-live verbucht. Wird eine Nachricht während der Bot läuft gelöscht, entfernt er auch deren XP.
-Nach dem Scan erscheint die interne XP-Liste im vorhandenen Bot-/MEE6-Textkanal.
+Im normalen Betrieb verarbeitet der Bot nur neue Nachrichten live. Wird eine gespeicherte
+Nachricht live gelöscht, werden deren XP sofort wieder abgezogen.
+
+Ein vollständiger Scan startet niemals automatisch beim Botstart. Er wird ausschließlich
+durch einen Administratorbefehl ausgelöst.
+
+### `!recalculate`
+
+Ein Mitglied mit der Berechtigung **Server verwalten** kann den gesamten Nachrichtenbestand
+neu berechnen:
+
+```text
+!recalculate
+```
+
+Der Bot merkt sich den exakten Startzeitpunkt und arbeitet anschließend in zwei Phasen:
+
+1. Alle erreichbaren Nachrichten vor dem Startzeitpunkt werden historisch eingelesen.
+2. Danach werden Nachrichten ab dem Startzeitpunkt in einem schnellen Catch-up-Durchlauf
+   nachgezogen.
+
+Währenddessen werden neue und gelöschte Nachrichten gepuffert und beim Abschluss in den
+neuen Nachrichten-Snapshot übernommen. Danach läuft die Live-Verarbeitung normal weiter.
+Voice- und Invite-Verarbeitung bleiben während des gesamten Scans aktiv. `MessageXp` wird
+vollständig ersetzt. Zusätzlich verwendet der Bot Discord Member Search v2, um für aktuelle
+Servermitglieder den verwendeten Invite-Code, den Einlader und das echte Beitrittsdatum
+abzurufen. Noch nicht gespeicherte Zuordnungen werden in `invite_rewards` übernommen.
+
+Mitglieder, die bereits mindestens sieben Tage auf dem Server sind, lösen sofort die
+konfigurierte Invite-Belohnung aus. Jüngere Zuordnungen bleiben bis zum Erreichen der Frist
+offen. Weil dabei die konkrete Member-ID gespeichert wird, kann die Belohnung beim späteren
+Verlassen wieder zurückgebucht werden. Bereits gespeicherte Mitglieder werden nicht doppelt
+vergütet.
+
+Fortschritt und Ergebnisliste erscheinen im unter `BotChannel` konfigurierten Textkanal.
+Die Konsole zeigt zusätzlich Kanalstarts, gelesene Chargen, Threads, Catch-up und SQL-Phasen.
+
+### `!myrank`
+
+```text
+!myrank
+```
+
+Sendet ohne Begleittext eine PNG-Rangkarte auf Basis der bereitgestellten `rank.html`.
+Die Karte zeigt Discord-Avatar, Anzeigename, Rang unter den aktuellen Servermitgliedern,
+Level und Fortschritt bis zum nächsten Level.
+
+### `!recalculate-invites`
+
+```text
+!recalculate-invites
+```
+
+Berechnet ausschließlich die verfügbaren Invite-Zuordnungen neu. Nachrichten- und Voice-XP
+werden dabei nicht verändert. Der Befehl benötigt **Server verwalten**.
+
+## Voice-XP
+
+Voice-Zeit wird in vollständigen Blöcken vergütet. Standardmäßig gilt:
+
+- Blocklänge: 5 Minuten;
+- Belohnung je vollständigem Block: zufällig 5 bis 15 XP;
+- Prüfung laufender Sitzungen: standardmäßig jede Minute;
+- unvollständige Restzeit verfällt beim Verlassen.
+
+Bei 13 Minuten werden somit zwei 5-Minuten-Blöcke ausgezahlt; die restlichen 3 Minuten
+verfallen. Die laufende Sitzung wird in SQLite gespeichert.
+Beim Start werden vorhandene Sitzungen mit Discord abgeglichen. Falls Discord ein
+Voice-Join-Event nicht geliefert hat, legt der nächste Checkpoint die fehlende Sitzung
+automatisch an.
+
+Eine leere Liste unter `Voice.EligibleChannelIds` erlaubt alle Voice-Kanäle.
+`Voice.ExcludedChannelIds` schließt einzelne Kanäle aus.
+
+## Einladungen
+
+Neu erkannte Einladungen werden gespeichert und nach der konfigurierten Haltezeit vergütet.
+Bereits vergebene Invite-XP werden dauerhaft protokolliert und nicht doppelt ausgezahlt.
+Verlässt das eingeladene Mitglied später den Server, wird die zugehörige Belohnung
+zurückgebucht.
+
+Beim Start liest der Bot aktuelle Invite-Zähler nur als Ausgangsstand ein. Historische,
+bereits gespeicherte Einladungen werden ausschließlich durch diesen Slash-Command aktiviert:
+
+```text
+/einladungen-nachbearbeiten
+```
+
+Discord liefert keine vollständige historische Zuordnung von Mitgliedern zu Invite-Codes.
+Vanity-URLs und Beitritte während einer Offline-Zeit können deshalb nicht immer zugeordnet
+werden.
 
 ## Discord-App einrichten
 
-1. Im [Discord Developer Portal](https://discord.com/developers/applications) eine App und
-   einen Bot erstellen.
-2. Unter **Bot → Privileged Gateway Intents** den **Server Members Intent** aktivieren.
-3. Den Bot mit diesen Berechtigungen einladen:
-   - View Channels
-   - Send Messages
-   - Read Message History
-   - Use Application Commands
-   - Manage Server (zum Lesen der Discord-Einladungen)
-   - Manage Channels (zum automatischen Erstellen des MEE6-Befehlskanals)
-4. In Discord den Entwicklermodus aktivieren und per Rechtsklick die Server- und Kanal-IDs
-   kopieren.
+Im Discord Developer Portal müssen unter **Bot → Privileged Gateway Intents** aktiviert sein:
 
-## Konfiguration
+- Server Members Intent
+- Message Content Intent
 
-Ist der Bot nur auf einem Discord-Server, darf `Discord.GuildId` auf `0` bleiben und wird
-automatisch erkannt. Bei mehreren Servern muss die gewünschte Server-ID gesetzt werden.
-Der Token sollte nicht eingecheckt werden:
+Empfohlene Bot-Berechtigungen:
+
+- View Channels
+- Send Messages
+- Read Message History
+- Use Application Commands
+- Manage Server, damit Einladungen gelesen werden können
+- Manage Channels, falls Ausgabekanäle automatisch erstellt werden sollen
+
+## Konfiguration und Token
+
+Ist der Bot nur auf einem Server, darf `Discord.GuildId` auf `0` bleiben. Bei mehreren
+Servern muss die gewünschte Guild-ID gesetzt werden.
+
+Der Token sollte über eine Umgebungsvariable gesetzt und nicht in Git gespeichert werden:
 
 ```powershell
 $env:DISCORD_BOT_TOKEN = "DEIN_BOT_TOKEN"
 dotnet run
 ```
 
-Alternativ kann der Token lokal in `Discord.Token` stehen. Weitere unterstützte
-Umgebungsvariablen:
+Weitere unterstützte Umgebungsvariablen:
 
 - `DISCORD_GUILD_ID`
 - `BOT_DATABASE_PATH`
 - `BOT_CONFIG_PATH`
 
-Bei `Voice.EligibleChannelIds` bedeutet eine leere Liste: alle Voice-Kanäle. IDs in
-`Voice.ExcludedChannelIds` werden immer ausgeschlossen.
+Der Bot-Ausgabekanal wird über `BotChannel.ChannelId` oder `BotChannel.ChannelName`
+ausgewählt. Mit `BotChannel.CreateChannelIfMissing: true` wird er bei Bedarf erstellt.
 
-`Voice.MinimumRewardableMinutes` steht standardmäßig auf `5`: Wer vorher geht, erhält keine
-Voice-XP. Beim Erreichen der fünften Minute werden alle fünf Minuten vergütet. Danach zählt
-jede weitere vollständige Minute derselben Sitzung. Bei einem Wechsel in einen anderen
-Voice-Chat beginnt die Mindestzeit erneut.
+Mit `"Debug": { "Enabled": true }` zeigt die Konsole erkannte Voice-Bewegungen und jede
+tatsächlich angewendete positive oder negative XP-Bewegung.
 
-Mit `"Debug": { "Enabled": true }` protokolliert die Konsole jeden erkannten Voice-Beitritt,
-Voice-Austritt und Kanalwechsel mit Benutzer- und Kanal-ID. Bei `false` werden diese
-Bewegungsmeldungen ausgeblendet.
-
-Die Nachrichtenwerte stehen unter `Messages`. Für den historischen Scan ist kein
-**Message Content Intent** notwendig, weil der Bot nur Message-ID und Autor auswertet.
-
-Mit `"ScanOnly": true` läuft der Bot vorerst ausschließlich als Historien-Scanner:
-Voice-, Invite-, MEE6-, Live-Nachrichten- und Slash-Command-Verarbeitung sind pausiert.
-Nach Abschluss schreibt er eine Scan-Zusammenfassung und die vollständige User-XP-Liste in
-den bestehenden Bot-Textkanal.
-
-Direkt beim Start des Scans wird dort eine Statusnachricht angelegt. Sie zeigt den aktuell
-gelesenen Kanal, Nachrichtenzahlen und Laufzeit und wird während des Scans fortlaufend
-aktualisiert. Nach Abschluss wird diese Nachricht zur ersten Ergebnisseite.
-
-Die Konsole protokolliert zusätzlich jeden Arbeitsschritt mit `[SCAN]`: Kanal-Start und
--Ende, jede angefragte 100er-Nachrichtencharge, gefundene Threads, SQL-Zwischenstände sowie
-jede an Discord gesendete Ergebnisseite.
-
-Der Bot sucht beim Start den Kanal aus `Mee6Commands.ChannelId` oder
-`Mee6Commands.ChannelName`. Mit `CreateChannelIfMissing: true` wird
-`#mee6-xp-befehle` automatisch erstellt. Die Standardnachrichten sind:
-
-```text
-!give-xp @Benutzer 123
-!remove-xp @Benutzer 123
-```
-
-Die Vorlagen können über `GiveXpCommand` und `RemoveXpCommand` verändert werden. Verfügbare
-Platzhalter sind `{user}`, `{userId}` und `{xp}`.
-
-## Start
+## Start und Test
 
 ```powershell
 dotnet restore
 dotnet run
 ```
 
-Optionaler lokaler Funktionstest:
+Lokaler Selbsttest:
 
 ```powershell
 dotnet run --project tests/DiscordXpBot.SelfTest.csproj
 ```
 
-## Slash-Commands
+## Befehle
 
-- `/xp-admin benutzer betrag [grund]` – passt interne XP an und stellt den MEE6-Befehl bereit
-- `/einladungen-nachbearbeiten` (benötigt „Server verwalten“)
-- `/xp-liste` – gibt die aktuelle interne XP-Liste erneut im Bot-Textkanal aus
-
-## Neue und bisherige Einladungen
-
-Beim Start liest der Bot die aktuellen Invite-Zähler nur als Ausgangsstand ein. Daraus werden
-keine rückwirkenden XP erzeugt. Anschließend erkannte neue Joins werden automatisch gespeichert
-und nach der Haltezeit verarbeitet.
-
-Bereits vor diesem Update in SQLite vorhandene, noch offene Invite-Datensätze sind standardmäßig
-gesperrt. Erst `/einladungen-nachbearbeiten` schaltet sie frei. Der Befehl kann nur Datensätze
-verarbeiten, die bereits in SQLite stehen; Discord liefert keine vollständige historische
-Zuordnung von Mitgliedern zu Invite-Codes.
-
-## Grenzen des Invite-Trackings
-
-Discord sendet beim Beitritt nicht direkt den verwendeten Invite-Code. Der Bot vergleicht
-daher die Nutzungszähler aller Einladungen. Dafür muss er beim Start bereits laufen und
-„Server verwalten“ besitzen. Vanity-URLs und Beitritte während einer Offline-Zeit können
-nicht immer eindeutig einem Einladenden zugeordnet werden.
+- `!myrank` – sendet die eigene Rank-Karte als Bild
+- `!recalculate` – berechnet Nachrichten und verfügbare Invite-Zuordnungen neu
+- `!recalculate-invites` – berechnet ausschließlich Invite-Zuordnungen neu
+- `/xp-liste` – sendet die aktuelle interne XP-Liste in den Bot-Textkanal
+- `/einladungen-nachbearbeiten` – aktiviert gespeicherte historische Einladungen
