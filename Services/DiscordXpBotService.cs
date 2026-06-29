@@ -3099,6 +3099,20 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             return;
         }
 
+        var levelUpTitle = GetLevelUpTitle(movement.NewLevel);
+        var neededXp = Math.Max(
+            0,
+            movement.XpForNextLevel - movement.CurrentLevelProgress);
+        await _levelUpChannel.SendMessageAsync(
+            $"""
+            Endlich, <@{movement.UserId}> - {levelUpTitle} - hat Level **{movement.NewLevel:N0}** erreicht!
+            Gesamt-XP: **{movement.NewXp:N0}** | Bis Level {movement.NewLevel + 1:N0}: **{neededXp:N0} XP**
+            """);
+        if (movement.Applied)
+        {
+            return;
+        }
+
         await _levelUpChannel.SendMessageAsync(
             $"""
             🎉 <@{movement.UserId}> leveled up!
@@ -3110,6 +3124,18 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 movement.XpForNextLevel - movement.CurrentLevelProgress):N0}
             """);
     }
+
+    private static string GetLevelUpTitle(int level) =>
+        level switch
+        {
+            >= 100 => "Die Legende",
+            >= 75 => "Der Unaufhaltsame",
+            >= 50 => "Der Champion",
+            >= 25 => "Der Veteran",
+            >= 10 => "Der Wortgewandte",
+            >= 5 => "Der Aufsteiger",
+            _ => "Der Frischgelevelte"
+        };
 
     private void LogXpMovement(XpMovementResult? movement)
     {
