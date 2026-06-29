@@ -103,7 +103,8 @@ try
                 MessageXp: 120,
                 VoiceXp: 50,
                 InviteXp: 800,
-                RankColor: "#ABCDEF")
+                RankColor: "#ABCDEF",
+                ManualXp: 30)
         ],
         now);
     Assert(
@@ -113,10 +114,11 @@ try
         "Der Discord-JSON-Snapshot wurde nicht in eine leere Datenbank importiert.");
     var restoredAccount = await snapshotDatabase.GetInternalXpAccountAsync(guildId, 777);
     Assert(
-        restoredAccount.TotalXp == 970 &&
+        restoredAccount.TotalXp == 1000 &&
         restoredAccount.MessageXp == 120 &&
         restoredAccount.VoiceXp == 50 &&
         restoredAccount.InviteXp == 800 &&
+        restoredAccount.ManualXp == 30 &&
         await snapshotDatabase.GetRankColorAsync(guildId, 777) == "#ABCDEF",
         "XP oder Farbe aus dem Discord-JSON-Snapshot wurden falsch wiederhergestellt.");
     var reopenedSnapshotDatabase = new BotDatabase(snapshotDatabasePath);
@@ -124,8 +126,42 @@ try
     var accountAfterRestart =
         await reopenedSnapshotDatabase.GetInternalXpAccountAsync(guildId, 777);
     Assert(
-        accountAfterRestart.TotalXp == 970,
+        accountAfterRestart.TotalXp == 1000 &&
+        accountAfterRestart.ManualXp == 30,
         "Die aus Discord wiederhergestellten XP überleben keinen Bot-Neustart.");
+
+    var mergeResult = await reopenedSnapshotDatabase.RestorePersistentUserProfilesAsync(
+        guildId,
+        [
+            new PersistentUserProfile(
+                777,
+                MessageXp: 90,
+                VoiceXp: 80,
+                InviteXp: 700,
+                RankColor: "#FEDCBA",
+                ManualXp: 45),
+            new PersistentUserProfile(
+                778,
+                MessageXp: 10,
+                VoiceXp: 0,
+                InviteXp: 0,
+                RankColor: "#111111",
+                ManualXp: 5)
+        ],
+        now.AddMinutes(1));
+    var mergedAccount = await reopenedSnapshotDatabase.GetInternalXpAccountAsync(guildId, 777);
+    var importedAccount = await reopenedSnapshotDatabase.GetInternalXpAccountAsync(guildId, 778);
+    Assert(
+        mergeResult.XpRestoreApplied &&
+        mergeResult.RestoredXpUsers == 2 &&
+        mergedAccount.MessageXp == 120 &&
+        mergedAccount.VoiceXp == 80 &&
+        mergedAccount.InviteXp == 800 &&
+        mergedAccount.ManualXp == 45 &&
+        mergedAccount.TotalXp == 1045 &&
+        importedAccount.TotalXp == 15 &&
+        importedAccount.ManualXp == 5,
+        "Der Snapshot-Merge hat nicht pro Benutzer und XP-Topf den jeweils groessten Wert behalten.");
 
     var invite = new InviteRewardRecord(
         Guid.NewGuid().ToString("N"),
@@ -501,6 +537,7 @@ try
         sourceEntry.MessageXp == 35 &&
         sourceEntry.VoiceXp == 100 &&
         sourceEntry.InviteXp == 200 &&
+        sourceEntry.ManualXp == 0 &&
         sourceEntry.TotalXp == 335 &&
         directSourceEntry == sourceEntry,
         "Die drei XP-Töpfe wurden nicht getrennt gespeichert oder korrekt summiert.");
@@ -512,8 +549,35 @@ try
         sourceEntry.MessageXp == 0 &&
         sourceEntry.VoiceXp == 100 &&
         sourceEntry.InviteXp == 200 &&
+        sourceEntry.ManualXp == 0 &&
         sourceEntry.TotalXp == 300,
         "Die Neuberechnung hat Voice- oder Invite-XP verändert.");
+
+    var manualGrant = await database.AddManualXpAsync(
+        guildId,
+        sourceUserId,
+        80,
+        "manual-give:self-test",
+        "manual-give:self-test",
+        now.AddMinutes(2));
+    var manualRemoval = await database.RemoveManualXpAsync(
+        guildId,
+        sourceUserId,
+        30,
+        "manual-remove:self-test",
+        "manual-remove:self-test",
+        now.AddMinutes(3));
+    sourceEntry = (await database.GetInternalXpLeaderboardAsync(guildId))
+        .Single(entry => entry.UserId == sourceUserId);
+    Assert(
+        manualGrant.Amount == 80 &&
+        manualRemoval.Amount == -30 &&
+        sourceEntry.MessageXp == 0 &&
+        sourceEntry.VoiceXp == 100 &&
+        sourceEntry.InviteXp == 200 &&
+        sourceEntry.ManualXp == 50 &&
+        sourceEntry.TotalXp == 350,
+        "Manuelle XP wurden nicht separat vergeben oder entfernt.");
 
     var reopenedDatabase = new BotDatabase(databasePath);
     await reopenedDatabase.InitializeAsync();
@@ -524,9 +588,10 @@ try
         persistedSourceEntry.MessageXp == 0 &&
         persistedSourceEntry.VoiceXp == 100 &&
         persistedSourceEntry.InviteXp == 200 &&
-        persistedSourceEntry.TotalXp == 300 &&
+        persistedSourceEntry.ManualXp == 50 &&
+        persistedSourceEntry.TotalXp == 350 &&
         persistedSourceEntry.CurrentLevel ==
-        LevelCalculator.CalculateLevelFromTotalXp(300).Level,
+        LevelCalculator.CalculateLevelFromTotalXp(350).Level,
         "XP-Töpfe oder Level wurden nach einem Datenbank-Neustart nicht wiederhergestellt.");
 
     const ulong levelUserId = 900;

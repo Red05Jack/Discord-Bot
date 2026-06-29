@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -541,6 +542,47 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 return;
             }
 
+            if (message is SocketUserMessage giveXpMessage &&
+                TryGetCommandArguments(
+                    giveXpMessage.Content,
+                    "!givexp",
+                    out var giveXpArguments))
+            {
+                await HandleManualXpCommandAsync(
+                    giveXpMessage,
+                    guildChannel.Guild,
+                    giveXpArguments,
+                    remove: false);
+                return;
+            }
+
+            if (message is SocketUserMessage removeXpMessage &&
+                TryGetCommandArguments(
+                    removeXpMessage.Content,
+                    "!removexp",
+                    out var removeXpArguments))
+            {
+                await HandleManualXpCommandAsync(
+                    removeXpMessage,
+                    guildChannel.Guild,
+                    removeXpArguments,
+                    remove: true);
+                return;
+            }
+
+            if (message is SocketUserMessage importDbMessage &&
+                TryGetCommandArguments(
+                    importDbMessage.Content,
+                    "!importdb",
+                    out var importDbArguments))
+            {
+                await HandleImportDbCommandAsync(
+                    importDbMessage,
+                    guildChannel.Guild,
+                    importDbArguments);
+                return;
+            }
+
             if (!_options.Messages.Enabled || !IsRewardableMessage(message))
             {
                 return;
@@ -775,6 +817,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 - Nachrichten-XP: **{account.MessageXp:N0}**
                 - Voice-XP: **{account.VoiceXp:N0}**
                 - Invite-XP: **{account.InviteXp:N0}**
+                - Manual-XP: **{account.ManualXp:N0}**
                 - Gewertete Nachrichten: **{account.MessageCount:N0}**
                 - Rank-Farbe: **{rankColor}**
                 """,
@@ -857,6 +900,154 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         }
     }
 
+    private async Task HandleManualXpCommandAsync(
+        SocketUserMessage message,
+        SocketGuild guild,
+        IReadOnlyList<string> arguments,
+        bool remove)
+    {
+        if (message.Author is not SocketGuildUser guildUser ||
+            !IsBotMaster(guildUser))
+        {
+            await message.Channel.SendMessageAsync(
+                "Dieser Befehl ist nur fÃ¼r Bot-Master-Rollen verfÃ¼gbar.");
+            return;
+        }
+
+        if (arguments.Count < 2 ||
+            !TryParseUserReference(arguments[0], out var targetUserId) ||
+            guild.GetUser(targetUserId) is not { } targetUser ||
+            !int.TryParse(
+                arguments[1],
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var amount) ||
+            amount <= 0)
+        {
+            await message.Channel.SendMessageAsync(
+                remove
+                    ? "Verwendung: `!removexp @user 100 [Grund]`"
+                    : "Verwendung: `!givexp @user 100 [Grund]`");
+            return;
+        }
+
+        var note = arguments.Count > 2
+            ? string.Join(' ', arguments.Skip(2)).Trim()
+            : string.Empty;
+        var reasonPrefix = remove ? "manual-remove" : "manual-give";
+        var reason = string.IsNullOrWhiteSpace(note)
+            ? reasonPrefix
+            : $"{reasonPrefix}:{note}";
+        var referenceId = $"{reasonPrefix}:{message.Id}:{targetUserId}";
+        var movement = remove
+            ? await _database.RemoveManualXpAsync(
+                guild.Id,
+                targetUserId,
+                amount,
+                reason,
+                referenceId,
+                DateTimeOffset.UtcNow)
+            : await _database.AddManualXpAsync(
+                guild.Id,
+                targetUserId,
+                amount,
+                reason,
+                referenceId,
+                DateTimeOffset.UtcNow);
+
+        LogXpMovement(movement);
+        await NotifyLevelUpAsync(movement);
+        var account = await _database.GetInternalXpAccountAsync(guild.Id, targetUserId);
+        await message.Channel.SendMessageAsync(
+            $"""
+            <@{targetUser.Id}>: Manual-XP **{movement.Amount:+#;-#;0}**.
+            Manual-XP jetzt: **{account.ManualXp:N0}** | Gesamt-XP: **{account.TotalXp:N0}**
+            """,
+            allowedMentions: AllowedMentions.None);
+    }
+
+    private async Task HandleImportDbCommandAsync(
+        SocketUserMessage message,
+        SocketGuild guild,
+        IReadOnlyList<string> arguments)
+    {
+        if (message.Author is not SocketGuildUser guildUser ||
+            !IsBotMaster(guildUser))
+        {
+            await message.Channel.SendMessageAsync(
+                "Dieser Befehl ist nur fÃ¼r Bot-Master-Rollen verfÃ¼gbar.");
+            return;
+        }
+
+        if (arguments.Count != 0 || message.Attachments.Count == 0)
+        {
+            await message.Channel.SendMessageAsync(
+                "Verwendung: `!importdb` mit einem oder mehreren `bot-db.json`-Snapshots als Anhang.");
+            return;
+        }
+
+        var snapshots = new List<DiscordDatabaseSnapshot>();
+        foreach (var attachment in message.Attachments)
+        {
+            var json = await ReadDatabaseSnapshotJsonAsync(attachment);
+            DiscordDatabaseSnapshot? snapshot;
+            try
+            {
+                snapshot = JsonSerializer.Deserialize<DiscordDatabaseSnapshot>(
+                    json,
+                    DatabaseJsonOptions);
+            }
+            catch (JsonException)
+            {
+                await message.Channel.SendMessageAsync(
+                    $"`{attachment.Filename}` ist kein gÃ¼ltiger bot-db-JSON-Snapshot.");
+                return;
+            }
+
+            if (snapshot is null)
+            {
+                throw new InvalidOperationException(
+                    $"Der Snapshot `{attachment.Filename}` konnte nicht gelesen werden.");
+            }
+
+            if (snapshot.GuildId != guild.Id)
+            {
+                await message.Channel.SendMessageAsync(
+                    $"`{attachment.Filename}` gehÃ¶rt zu Server `{snapshot.GuildId}` und wurde nicht importiert.");
+                return;
+            }
+
+            snapshots.Add(snapshot);
+        }
+
+        if (snapshots.Count == 0)
+        {
+            await message.Channel.SendMessageAsync("Es wurde kein lesbarer Snapshot gefunden.");
+            return;
+        }
+
+        var mergedProfiles = MergeSnapshotProfiles(snapshots);
+        var latestSnapshotTime = snapshots
+            .Select(snapshot => snapshot.GeneratedAtUtc)
+            .DefaultIfEmpty(DateTimeOffset.UtcNow)
+            .Max();
+        var result = await _database.RestorePersistentUserProfilesAsync(
+            guild.Id,
+            mergedProfiles,
+            latestSnapshotTime);
+        ScheduleDatabaseSnapshot();
+
+        await message.Channel.SendMessageAsync(
+            $"""
+            Import abgeschlossen.
+            Snapshots gelesen: **{snapshots.Count:N0}**
+            Benutzer nach Merge: **{mergedProfiles.Count:N0}**
+            XP-Benutzer erhÃ¶ht: **{result.RestoredXpUsers:N0}**
+            Farben geschrieben: **{result.RestoredColors:N0}**
+            """,
+            allowedMentions: AllowedMentions.None);
+    }
+
     private bool IsBotMaster(SocketGuildUser user) =>
         user.Roles.Any(role => _botMasterRoleIds.Contains(role.Id));
 
@@ -915,6 +1106,9 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 """
 
                 ### Bot-Master
+                - `!givexp @user 100 [Grund]` - schreibt XP auf das manuelle XP-Konto
+                - `!removexp @user 100 [Grund]` - entfernt XP vom manuellen XP-Konto
+                - `!importdb` - importiert einen oder mehrere angehaengte bot-db-Snapshots
                 - `!myrank @user debug` – zeigt interne XP-Werte
                 - `!recalculate all` – berechnet Nachrichten und Einladungen neu
                 - `!recalculate messages` – berechnet nur Nachrichten neu
@@ -980,6 +1174,10 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         return ulong.TryParse(idText, out userId);
     }
 
+    private static bool TryParseUserReference(string value, out ulong userId) =>
+        TryParseUserMention(value, out userId) ||
+        ulong.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out userId);
+
     private static bool TryNormalizeRankColor(
         string value,
         out string rankColor)
@@ -1001,7 +1199,10 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         TryGetCommandArguments(content, "!set-rank-color", out _) ||
         TryGetCommandArguments(content, "!myrank", out _) ||
         TryGetCommandArguments(content, "!recalculate", out _) ||
-        TryGetCommandArguments(content, "!recalculate-invites", out _);
+        TryGetCommandArguments(content, "!recalculate-invites", out _) ||
+        TryGetCommandArguments(content, "!givexp", out _) ||
+        TryGetCommandArguments(content, "!removexp", out _) ||
+        TryGetCommandArguments(content, "!importdb", out _);
 
     private async Task OnMessageDeletedAsync(
         Cacheable<IMessage, ulong> message,
@@ -2307,7 +2508,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             .Select(user => user.Id)
             .Distinct()
             .Select(userId => entriesByUser.GetValueOrDefault(userId) ??
-                              new InternalXpEntry(userId, 0, 0, 0, 0, 0, 0, 0))
+                              new InternalXpEntry(userId, 0, 0, 0, 0, 0, 0, 0, 0))
             .OrderByDescending(entry => entry.TotalXp)
             .ThenBy(entry => entry.UserId)
             .ToArray();
@@ -2403,7 +2604,8 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 $"{entry.CurrentLevelProgress:N0}/" +
                 $"{LevelCalculator.GetXpForNextLevel(entry.CurrentLevel):N0} | " +
                 $"Text: {entry.MessageXp:N0} | Voice: {entry.VoiceXp:N0} | " +
-                $"Invites: {entry.InviteXp:N0} | Nachrichten: {entry.MessageCount:N0}\n";
+                $"Invites: {entry.InviteXp:N0} | Manual: {entry.ManualXp:N0} | " +
+                $"Nachrichten: {entry.MessageCount:N0}\n";
 
             if (current.Length > 0 && current.Length + line.Length > 1450)
             {
@@ -2617,7 +2819,8 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                     profile.MessageXp,
                     profile.VoiceXp,
                     profile.InviteXp,
-                    profile.RankColor)).ToArray());
+                    profile.RankColor,
+                    profile.ManualXp)).ToArray());
             var json = JsonSerializer.Serialize(snapshot, DatabaseJsonOptions);
             var inlineContent =
                 $"{DatabaseSnapshotMarker}\n```json\n{json}\n```";
@@ -2722,12 +2925,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
         var result = await _database.RestorePersistentUserProfilesAsync(
             _guild.Id,
-            snapshot.Users.Select(user => new PersistentUserProfile(
-                user.UserId,
-                user.MessageXp,
-                user.VoiceXp,
-                user.InviteXp,
-                user.RankColor)).ToArray(),
+            MergeSnapshotProfiles([snapshot]),
             snapshot.GeneratedAtUtc);
         Console.WriteLine(
             $"[{DateTimeOffset.Now:O}] [BOT-DB] Snapshot gelesen | " +
@@ -2738,20 +2936,10 @@ public sealed class DiscordXpBotService : IAsyncDisposable
     private async Task<string?> ReadDatabaseSnapshotJsonAsync(
         IUserMessage message)
     {
-        const string jsonStart = "```json\n";
-        var startIndex = message.Content.IndexOf(
-            jsonStart,
-            StringComparison.Ordinal);
-        if (startIndex >= 0)
+        var inlineJson = ExtractDatabaseSnapshotJson(message.Content);
+        if (!string.IsNullOrWhiteSpace(inlineJson))
         {
-            startIndex += jsonStart.Length;
-            var endIndex = message.Content.LastIndexOf(
-                "\n```",
-                StringComparison.Ordinal);
-            if (endIndex > startIndex)
-            {
-                return message.Content[startIndex..endIndex];
-            }
+            return inlineJson;
         }
 
         var attachment = message.Attachments.FirstOrDefault(item =>
@@ -2759,9 +2947,99 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 item.Filename,
                 "bot-db.json",
                 StringComparison.OrdinalIgnoreCase));
-        return attachment is null
-            ? null
-            : await _httpClient.GetStringAsync(attachment.Url);
+        if (attachment is null)
+        {
+            return null;
+        }
+
+        var content = await _httpClient.GetStringAsync(attachment.Url);
+        return ExtractDatabaseSnapshotJson(content) ?? content;
+    }
+
+    private async Task<string> ReadDatabaseSnapshotJsonAsync(IAttachment attachment)
+    {
+        var content = await _httpClient.GetStringAsync(attachment.Url);
+        return ExtractDatabaseSnapshotJson(content) ?? content;
+    }
+
+    private static string? ExtractDatabaseSnapshotJson(string content)
+    {
+        const string jsonStart = "```json\n";
+        var startIndex = content.IndexOf(
+            jsonStart,
+            StringComparison.Ordinal);
+        if (startIndex >= 0)
+        {
+            startIndex += jsonStart.Length;
+            var endIndex = content.LastIndexOf(
+                "\n```",
+                StringComparison.Ordinal);
+            if (endIndex > startIndex)
+            {
+                return content[startIndex..endIndex];
+            }
+        }
+
+        var trimmed = content.Trim();
+        if (trimmed.StartsWith(DatabaseSnapshotMarker, StringComparison.Ordinal))
+        {
+            trimmed = trimmed[DatabaseSnapshotMarker.Length..].Trim();
+        }
+
+        return trimmed.StartsWith('{') ? trimmed : null;
+    }
+
+    private static IReadOnlyList<PersistentUserProfile> MergeSnapshotProfiles(
+        IEnumerable<DiscordDatabaseSnapshot> snapshots)
+    {
+        var profilesByUser = new Dictionary<ulong, PersistentUserProfile>();
+        foreach (var snapshot in snapshots.OrderBy(snapshot => snapshot.GeneratedAtUtc))
+        {
+            foreach (var user in snapshot.Users)
+            {
+                var profile = ToPersistentProfile(user);
+                if (!profilesByUser.TryGetValue(profile.UserId, out var existing))
+                {
+                    profilesByUser[profile.UserId] = profile;
+                    continue;
+                }
+
+                profilesByUser[profile.UserId] = new PersistentUserProfile(
+                    profile.UserId,
+                    Math.Max(existing.MessageXp, profile.MessageXp),
+                    Math.Max(existing.VoiceXp, profile.VoiceXp),
+                    Math.Max(existing.InviteXp, profile.InviteXp),
+                    profile.RankColor,
+                    Math.Max(existing.ManualXp, profile.ManualXp));
+            }
+        }
+
+        return profilesByUser.Values
+            .OrderBy(profile => profile.UserId)
+            .ToArray();
+    }
+
+    private static PersistentUserProfile ToPersistentProfile(
+        DiscordDatabaseUser user)
+    {
+        var messageXp = Math.Max(0, user.MessageXp);
+        var voiceXp = Math.Max(0, user.VoiceXp);
+        var inviteXp = Math.Max(0, user.InviteXp);
+        var manualXp = Math.Max(0, user.ManualXp);
+        var sourceTotal = messageXp + voiceXp + inviteXp + manualXp;
+        var storedTotal = Math.Max(0, user.TotalXp);
+        if (storedTotal > sourceTotal)
+        {
+            manualXp += storedTotal - sourceTotal;
+        }
+
+        return new PersistentUserProfile(
+            user.UserId,
+            messageXp,
+            voiceXp,
+            inviteXp,
+            user.RankColor,
+            manualXp);
     }
 
     private async Task<ITextChannel?> GetOrCreateLevelUpChannelAsync()
@@ -2974,13 +3252,38 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         DateTimeOffset GeneratedAtUtc,
         IReadOnlyList<DiscordDatabaseUser> Users);
 
-    private sealed record DiscordDatabaseUser(
-        ulong UserId,
-        long TotalXp,
-        long MessageXp,
-        long VoiceXp,
-        long InviteXp,
-        string RankColor);
+    private sealed record DiscordDatabaseUser
+    {
+        public DiscordDatabaseUser()
+        {
+        }
+
+        public DiscordDatabaseUser(
+            ulong userId,
+            long totalXp,
+            long messageXp,
+            long voiceXp,
+            long inviteXp,
+            string rankColor,
+            long manualXp)
+        {
+            UserId = userId;
+            TotalXp = totalXp;
+            MessageXp = messageXp;
+            VoiceXp = voiceXp;
+            InviteXp = inviteXp;
+            RankColor = rankColor;
+            ManualXp = manualXp;
+        }
+
+        public ulong UserId { get; init; }
+        public long TotalXp { get; init; }
+        public long MessageXp { get; init; }
+        public long VoiceXp { get; init; }
+        public long InviteXp { get; init; }
+        public string RankColor { get; init; } = "#FFFFFF";
+        public long ManualXp { get; init; }
+    }
 
     private sealed record MessageChannelProgress(
         int Scanned,

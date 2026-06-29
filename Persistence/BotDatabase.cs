@@ -49,6 +49,7 @@ public sealed class BotDatabase
                     message_xp INTEGER NOT NULL DEFAULT 0,
                     voice_xp INTEGER NOT NULL DEFAULT 0,
                     invite_xp INTEGER NOT NULL DEFAULT 0,
+                    manual_xp INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (guild_id, user_id)
                 );
 
@@ -65,6 +66,7 @@ public sealed class BotDatabase
                     message_xp INTEGER NOT NULL DEFAULT 0,
                     voice_xp INTEGER NOT NULL DEFAULT 0,
                     invite_xp INTEGER NOT NULL DEFAULT 0,
+                    manual_xp INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (guild_id, user_id)
                 );
 
@@ -182,6 +184,16 @@ public sealed class BotDatabase
                 connection,
                 "internal_xp_accounts",
                 "invite_xp",
+                "INTEGER NOT NULL DEFAULT 0");
+            await EnsureColumnAsync(
+                connection,
+                "internal_xp_accounts",
+                "manual_xp",
+                "INTEGER NOT NULL DEFAULT 0");
+            await EnsureColumnAsync(
+                connection,
+                "xp_snapshot_baselines",
+                "manual_xp",
                 "INTEGER NOT NULL DEFAULT 0");
             await EnsureColumnAsync(
                 connection,
@@ -920,6 +932,43 @@ public sealed class BotDatabase
         }
     }
 
+    public async Task<XpMovementResult> AddManualXpAsync(
+        ulong guildId,
+        ulong userId,
+        int amount,
+        string reason,
+        string referenceId,
+        DateTimeOffset timestamp)
+    {
+        if (amount < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(amount), "Amount must not be negative.");
+        }
+
+        await _gate.WaitAsync();
+        try
+        {
+            await using var connection = await OpenConnectionAsync();
+            using var transaction = connection.BeginTransaction();
+            var result = await ApplyXpMovementAsync(
+                connection,
+                transaction,
+                guildId,
+                userId,
+                amount,
+                reason,
+                referenceId,
+                timestamp,
+                XpSource.Manual);
+            transaction.Commit();
+            return result;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public async Task EnsureUserAccountsAsync(
         ulong guildId,
         IEnumerable<ulong> userIds)
@@ -938,9 +987,9 @@ public sealed class BotDatabase
                     """
                     INSERT OR IGNORE INTO internal_xp_accounts (
                         guild_id, user_id, total_xp, current_level, current_level_progress,
-                        message_xp, voice_xp, invite_xp
+                        message_xp, voice_xp, invite_xp, manual_xp
                     )
-                    VALUES ($guildId, $userId, 0, 0, 0, 0, 0, 0);
+                    VALUES ($guildId, $userId, 0, 0, 0, 0, 0, 0, 0);
                     """;
                 AddParameter(command, "$guildId", Id(guildId));
                 AddParameter(command, "$userId", Id(userId));
@@ -1022,6 +1071,7 @@ public sealed class BotDatabase
                     accounts.message_xp,
                     accounts.voice_xp,
                     accounts.invite_xp,
+                    accounts.manual_xp,
                     COALESCE(preferences.rank_color, '#FFFFFF')
                 FROM internal_xp_accounts AS accounts
                 LEFT JOIN user_preferences AS preferences
@@ -1039,7 +1089,8 @@ public sealed class BotDatabase
                     reader.GetInt64(1),
                     reader.GetInt64(2),
                     reader.GetInt64(3),
-                    reader.GetString(4)));
+                    reader.GetString(5),
+                    reader.GetInt64(4)));
             }
 
             return profiles;
@@ -1060,7 +1111,11 @@ public sealed class BotDatabase
         {
             await using var connection = await OpenConnectionAsync();
             using var transaction = connection.BeginTransaction();
-            var canRestoreXp = await HasNoStoredXpAsync(
+            var currentTotals = await ReadXpSourceTotalsAsync(
+                connection,
+                transaction,
+                guildId);
+            var recordedMessageXp = await ReadRecordedMessageXpAsync(
                 connection,
                 transaction,
                 guildId);
@@ -1068,9 +1123,22 @@ public sealed class BotDatabase
             var restoredColors = 0;
 
             foreach (var profile in profiles
-                         .GroupBy(profile => profile.UserId)
-                         .Select(group => group.Last()))
+                          .GroupBy(profile => profile.UserId)
+                          .Select(MergePersistentProfiles))
             {
+                var importTotals = new XpSourceTotals(
+                    Math.Max(0, profile.MessageXp),
+                    Math.Max(0, profile.VoiceXp),
+                    Math.Max(0, profile.InviteXp),
+                    Math.Max(0, profile.ManualXp));
+                currentTotals.TryGetValue(profile.UserId, out var oldTotals);
+                oldTotals ??= new XpSourceTotals();
+                var newTotals = new XpSourceTotals(
+                    Math.Max(oldTotals.MessageXp, importTotals.MessageXp),
+                    Math.Max(oldTotals.VoiceXp, importTotals.VoiceXp),
+                    Math.Max(oldTotals.InviteXp, importTotals.InviteXp),
+                    Math.Max(oldTotals.ManualXp, importTotals.ManualXp));
+
                 await using (var preference = connection.CreateCommand())
                 {
                     preference.Transaction = transaction;
@@ -1091,46 +1159,65 @@ public sealed class BotDatabase
                     restoredColors++;
                 }
 
-                if (!canRestoreXp)
-                {
-                    continue;
-                }
-
-                var totals = new XpSourceTotals(
-                    Math.Max(0, profile.MessageXp),
-                    Math.Max(0, profile.VoiceXp),
-                    Math.Max(0, profile.InviteXp));
                 await using (var baseline = connection.CreateCommand())
                 {
+                    var messageBaseline = Math.Max(
+                        0,
+                        newTotals.MessageXp -
+                        recordedMessageXp.GetValueOrDefault(profile.UserId));
                     baseline.Transaction = transaction;
                     baseline.CommandText =
                         """
                         INSERT INTO xp_snapshot_baselines (
-                            guild_id, user_id, message_xp, voice_xp, invite_xp
+                            guild_id, user_id, message_xp, voice_xp, invite_xp, manual_xp
                         )
                         VALUES (
-                            $guildId, $userId, $messageXp, $voiceXp, $inviteXp
+                            $guildId, $userId, $messageXp, $voiceXp, $inviteXp, $manualXp
                         )
                         ON CONFLICT (guild_id, user_id) DO UPDATE SET
                             message_xp = excluded.message_xp,
                             voice_xp = excluded.voice_xp,
-                            invite_xp = excluded.invite_xp;
+                            invite_xp = excluded.invite_xp,
+                            manual_xp = excluded.manual_xp;
                         """;
                     AddParameter(baseline, "$guildId", Id(guildId));
                     AddParameter(baseline, "$userId", Id(profile.UserId));
-                    AddParameter(baseline, "$messageXp", totals.MessageXp);
-                    AddParameter(baseline, "$voiceXp", totals.VoiceXp);
-                    AddParameter(baseline, "$inviteXp", totals.InviteXp);
+                    AddParameter(baseline, "$messageXp", messageBaseline);
+                    AddParameter(baseline, "$voiceXp", newTotals.VoiceXp);
+                    AddParameter(baseline, "$inviteXp", newTotals.InviteXp);
+                    AddParameter(baseline, "$manualXp", newTotals.ManualXp);
                     await baseline.ExecuteNonQueryAsync();
                 }
 
-                var cumulativeXp = 0L;
+                if (newTotals == oldTotals)
+                {
+                    continue;
+                }
+
+                var cumulativeXp = oldTotals.TotalXp;
                 foreach (var source in new[]
-                         {
-                             (Amount: totals.MessageXp, Reason: "message-snapshot"),
-                             (Amount: totals.VoiceXp, Reason: "voice-snapshot"),
-                             (Amount: totals.InviteXp, Reason: "invite-snapshot")
-                         })
+                          {
+                              (
+                                  Amount: newTotals.MessageXp - oldTotals.MessageXp,
+                                  NewValue: newTotals.MessageXp,
+                                  Reason: "message-snapshot"
+                              ),
+                              (
+                                  Amount: newTotals.VoiceXp - oldTotals.VoiceXp,
+                                  NewValue: newTotals.VoiceXp,
+                                  Reason: "voice-snapshot"
+                              ),
+                              (
+                                  Amount: newTotals.InviteXp - oldTotals.InviteXp,
+                                  NewValue: newTotals.InviteXp,
+                                  Reason: "invite-snapshot"
+                              ),
+                              (
+                                  Amount: newTotals.ManualXp - oldTotals.ManualXp,
+                                  NewValue: newTotals.ManualXp,
+                                  Reason: "manual-snapshot"
+                              )
+                          })
                 {
                     if (source.Amount <= 0)
                     {
@@ -1149,27 +1236,28 @@ public sealed class BotDatabase
                         profile.UserId,
                         checked((int)source.Amount),
                         source.Reason,
-                        $"discord-db:{guildId}:{profile.UserId}:{source.Reason}",
+                        $"discord-db:{guildId}:{profile.UserId}:{source.Reason}:{source.NewValue}",
                         timestamp,
                         oldState,
                         newState);
                 }
 
                 var finalState =
-                    LevelCalculator.CalculateLevelFromTotalXp(totals.TotalXp);
+                    LevelCalculator.CalculateLevelFromTotalXp(newTotals.TotalXp);
                 await UpsertXpAccountAsync(
                     connection,
                     transaction,
                     guildId,
                     profile.UserId,
-                    totals,
+                    newTotals,
                     finalState);
+                currentTotals[profile.UserId] = newTotals;
                 restoredXpUsers++;
             }
 
             transaction.Commit();
             return new PersistentRestoreResult(
-                canRestoreXp,
+                restoredXpUsers > 0,
                 restoredXpUsers,
                 restoredColors);
         }
@@ -1207,6 +1295,43 @@ public sealed class BotDatabase
                 referenceId,
                 timestamp,
                 ResolveXpSource(reason));
+            transaction.Commit();
+            return result;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<XpMovementResult> RemoveManualXpAsync(
+        ulong guildId,
+        ulong userId,
+        int amount,
+        string reason,
+        string referenceId,
+        DateTimeOffset timestamp)
+    {
+        if (amount < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(amount), "Amount must not be negative.");
+        }
+
+        await _gate.WaitAsync();
+        try
+        {
+            await using var connection = await OpenConnectionAsync();
+            using var transaction = connection.BeginTransaction();
+            var result = await ApplyXpMovementAsync(
+                connection,
+                transaction,
+                guildId,
+                userId,
+                -amount,
+                reason,
+                referenceId,
+                timestamp,
+                XpSource.Manual);
             transaction.Commit();
             return result;
         }
@@ -1362,7 +1487,7 @@ public sealed class BotDatabase
                 select.Transaction = transaction;
                 select.CommandText =
                     """
-                    SELECT user_id, message_xp, voice_xp, invite_xp
+                    SELECT user_id, message_xp, voice_xp, invite_xp, manual_xp
                     FROM internal_xp_accounts
                     WHERE guild_id = $guildId;
                     """;
@@ -1374,7 +1499,8 @@ public sealed class BotDatabase
                         new XpSourceTotals(
                             reader.GetInt64(1),
                             reader.GetInt64(2),
-                            reader.GetInt64(3));
+                            reader.GetInt64(3),
+                            reader.GetInt64(4));
                 }
             }
 
@@ -1510,6 +1636,7 @@ public sealed class BotDatabase
                     accounts.message_xp,
                     accounts.voice_xp,
                     accounts.invite_xp,
+                    accounts.manual_xp,
                     COALESCE(messages.message_count, 0)
                 FROM internal_xp_accounts AS accounts
                 LEFT JOIN (
@@ -1533,7 +1660,8 @@ public sealed class BotDatabase
                     reader.GetInt64(4),
                     reader.GetInt64(5),
                     reader.GetInt64(6),
-                    reader.GetInt64(7)));
+                    reader.GetInt64(7),
+                    reader.GetInt64(8)));
             }
 
             return entries;
@@ -1946,11 +2074,11 @@ public sealed class BotDatabase
                 """
                 INSERT INTO internal_xp_accounts (
                     guild_id, user_id, total_xp, current_level, current_level_progress,
-                    message_xp, voice_xp, invite_xp
+                    message_xp, voice_xp, invite_xp, manual_xp
                 )
                 VALUES (
                     $guildId, $userId, $totalXp, $currentLevel, $progress,
-                    $messageXp, $voiceXp, $inviteXp
+                    $messageXp, $voiceXp, $inviteXp, $manualXp
                 );
                 """;
             AddParameter(account, "$guildId", Id(pair.Key.GuildId));
@@ -1961,6 +2089,7 @@ public sealed class BotDatabase
             AddParameter(account, "$messageXp", pair.Value.MessageXp);
             AddParameter(account, "$voiceXp", pair.Value.VoiceXp);
             AddParameter(account, "$inviteXp", pair.Value.InviteXp);
+            AddParameter(account, "$manualXp", pair.Value.ManualXp);
             await account.ExecuteNonQueryAsync();
         }
 
@@ -1975,7 +2104,7 @@ public sealed class BotDatabase
         {
             selectAccounts.CommandText =
                 """
-                SELECT guild_id, user_id, message_xp, voice_xp, invite_xp
+                SELECT guild_id, user_id, message_xp, voice_xp, invite_xp, manual_xp
                 FROM internal_xp_accounts;
                 """;
             await using var reader = await selectAccounts.ExecuteReaderAsync();
@@ -1987,7 +2116,8 @@ public sealed class BotDatabase
                     new XpSourceTotals(
                         reader.GetInt64(2),
                         reader.GetInt64(3),
-                        reader.GetInt64(4));
+                        reader.GetInt64(4),
+                        reader.GetInt64(5));
             }
         }
 
@@ -2089,12 +2219,13 @@ public sealed class BotDatabase
         long oldMessageXp = 0;
         long oldVoiceXp = 0;
         long oldInviteXp = 0;
+        long oldManualXp = 0;
         await using (var readAccount = connection.CreateCommand())
         {
             readAccount.Transaction = transaction;
             readAccount.CommandText =
                 """
-                SELECT message_xp, voice_xp, invite_xp
+                SELECT message_xp, voice_xp, invite_xp, manual_xp
                 FROM internal_xp_accounts
                 WHERE guild_id = $guildId AND user_id = $userId;
                 """;
@@ -2106,13 +2237,15 @@ public sealed class BotDatabase
                 oldMessageXp = reader.GetInt64(0);
                 oldVoiceXp = reader.GetInt64(1);
                 oldInviteXp = reader.GetInt64(2);
+                oldManualXp = reader.GetInt64(3);
             }
         }
 
-        var oldXp = oldMessageXp + oldVoiceXp + oldInviteXp;
+        var oldXp = oldMessageXp + oldVoiceXp + oldInviteXp + oldManualXp;
         var newMessageXp = oldMessageXp;
         var newVoiceXp = oldVoiceXp;
         var newInviteXp = oldInviteXp;
+        var newManualXp = oldManualXp;
 
         switch (source)
         {
@@ -2125,11 +2258,14 @@ public sealed class BotDatabase
             case XpSource.Invite:
                 newInviteXp = Math.Max(0, oldInviteXp + amount);
                 break;
+            case XpSource.Manual:
+                newManualXp = Math.Max(0, oldManualXp + amount);
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(source), source, null);
         }
 
-        var newXp = newMessageXp + newVoiceXp + newInviteXp;
+        var newXp = newMessageXp + newVoiceXp + newInviteXp + newManualXp;
         var effectiveAmount = checked((int)(newXp - oldXp));
         var oldState = LevelCalculator.CalculateLevelFromTotalXp(oldXp);
         var newState = LevelCalculator.CalculateLevelFromTotalXp(newXp);
@@ -2161,7 +2297,7 @@ public sealed class BotDatabase
             transaction,
             guildId,
             userId,
-            new XpSourceTotals(newMessageXp, newVoiceXp, newInviteXp),
+            new XpSourceTotals(newMessageXp, newVoiceXp, newInviteXp, newManualXp),
             newState);
         return new XpMovementResult(
             true,
@@ -2233,11 +2369,11 @@ public sealed class BotDatabase
             """
             INSERT INTO internal_xp_accounts (
                 guild_id, user_id, total_xp, current_level, current_level_progress,
-                message_xp, voice_xp, invite_xp
+                message_xp, voice_xp, invite_xp, manual_xp
             )
             VALUES (
                 $guildId, $userId, $totalXp, $currentLevel, $progress,
-                $messageXp, $voiceXp, $inviteXp
+                $messageXp, $voiceXp, $inviteXp, $manualXp
             )
             ON CONFLICT (guild_id, user_id) DO UPDATE SET
                 total_xp = excluded.total_xp,
@@ -2245,7 +2381,8 @@ public sealed class BotDatabase
                 current_level_progress = excluded.current_level_progress,
                 message_xp = excluded.message_xp,
                 voice_xp = excluded.voice_xp,
-                invite_xp = excluded.invite_xp;
+                invite_xp = excluded.invite_xp,
+                manual_xp = excluded.manual_xp;
             """;
         AddParameter(account, "$guildId", Id(guildId));
         AddParameter(account, "$userId", Id(userId));
@@ -2255,6 +2392,7 @@ public sealed class BotDatabase
         AddParameter(account, "$messageXp", totals.MessageXp);
         AddParameter(account, "$voiceXp", totals.VoiceXp);
         AddParameter(account, "$inviteXp", totals.InviteXp);
+        AddParameter(account, "$manualXp", totals.ManualXp);
         await account.ExecuteNonQueryAsync();
     }
 
@@ -2299,6 +2437,91 @@ public sealed class BotDatabase
         return reader.GetInt64(0) == 0 && reader.GetInt64(1) == 0;
     }
 
+    private static async Task<Dictionary<ulong, XpSourceTotals>>
+        ReadXpSourceTotalsAsync(
+            SqliteConnection connection,
+            SqliteTransaction transaction,
+            ulong guildId)
+    {
+        var totalsByUser = new Dictionary<ulong, XpSourceTotals>();
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            """
+            SELECT user_id, message_xp, voice_xp, invite_xp, manual_xp
+            FROM internal_xp_accounts
+            WHERE guild_id = $guildId;
+            """;
+        AddParameter(command, "$guildId", Id(guildId));
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            totalsByUser[ulong.Parse(reader.GetString(0), CultureInfo.InvariantCulture)] =
+                new XpSourceTotals(
+                    reader.GetInt64(1),
+                    reader.GetInt64(2),
+                    reader.GetInt64(3),
+                    reader.GetInt64(4));
+        }
+
+        return totalsByUser;
+    }
+
+    private static async Task<Dictionary<ulong, long>> ReadRecordedMessageXpAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ulong guildId)
+    {
+        var messageXpByUser = new Dictionary<ulong, long>();
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            """
+            SELECT user_id, SUM(xp)
+            FROM message_xp
+            WHERE guild_id = $guildId
+            GROUP BY user_id;
+            """;
+        AddParameter(command, "$guildId", Id(guildId));
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            messageXpByUser[ulong.Parse(reader.GetString(0), CultureInfo.InvariantCulture)] =
+                reader.GetInt64(1);
+        }
+
+        return messageXpByUser;
+    }
+
+    private static PersistentUserProfile MergePersistentProfiles(
+        IEnumerable<PersistentUserProfile> profiles)
+    {
+        PersistentUserProfile? merged = null;
+        foreach (var profile in profiles)
+        {
+            var normalized = profile with
+            {
+                MessageXp = Math.Max(0, profile.MessageXp),
+                VoiceXp = Math.Max(0, profile.VoiceXp),
+                InviteXp = Math.Max(0, profile.InviteXp),
+                ManualXp = Math.Max(0, profile.ManualXp),
+                RankColor = NormalizeStoredRankColor(profile.RankColor)
+            };
+            merged = merged is null
+                ? normalized
+                : new PersistentUserProfile(
+                    normalized.UserId,
+                    Math.Max(merged.MessageXp, normalized.MessageXp),
+                    Math.Max(merged.VoiceXp, normalized.VoiceXp),
+                    Math.Max(merged.InviteXp, normalized.InviteXp),
+                    normalized.RankColor,
+                    Math.Max(merged.ManualXp, normalized.ManualXp));
+        }
+
+        return merged ??
+               new PersistentUserProfile(0, 0, 0, 0, "#FFFFFF");
+    }
+
     private static string NormalizeStoredRankColor(string? rankColor)
     {
         if (string.IsNullOrWhiteSpace(rankColor) ||
@@ -2341,6 +2564,13 @@ public sealed class BotDatabase
         if (reason.StartsWith("invite", StringComparison.OrdinalIgnoreCase))
         {
             return XpSource.Invite;
+        }
+
+        if (reason.StartsWith("manual", StringComparison.OrdinalIgnoreCase) ||
+            reason.StartsWith("givexp", StringComparison.OrdinalIgnoreCase) ||
+            reason.StartsWith("removexp", StringComparison.OrdinalIgnoreCase))
+        {
+            return XpSource.Manual;
         }
 
         return XpSource.Message;
@@ -2508,6 +2738,7 @@ public sealed record InternalXpEntry(
     long MessageXp,
     long VoiceXp,
     long InviteXp,
+    long ManualXp,
     long MessageCount);
 
 public sealed record PersistentUserProfile(
@@ -2515,9 +2746,10 @@ public sealed record PersistentUserProfile(
     long MessageXp,
     long VoiceXp,
     long InviteXp,
-    string RankColor)
+    string RankColor,
+    long ManualXp = 0)
 {
-    public long TotalXp => MessageXp + VoiceXp + InviteXp;
+    public long TotalXp => MessageXp + VoiceXp + InviteXp + ManualXp;
 }
 
 public sealed record PersistentRestoreResult(
@@ -2585,9 +2817,10 @@ internal sealed record StoredXpMovement(
 internal sealed record XpSourceTotals(
     long MessageXp = 0,
     long VoiceXp = 0,
-    long InviteXp = 0)
+    long InviteXp = 0,
+    long ManualXp = 0)
 {
-    public long TotalXp => MessageXp + VoiceXp + InviteXp;
+    public long TotalXp => MessageXp + VoiceXp + InviteXp + ManualXp;
 
     public XpSourceTotals Apply(XpSource source, int amount) =>
         source switch
@@ -2595,6 +2828,7 @@ internal sealed record XpSourceTotals(
             XpSource.Message => this with { MessageXp = Math.Max(0, MessageXp + amount) },
             XpSource.Voice => this with { VoiceXp = Math.Max(0, VoiceXp + amount) },
             XpSource.Invite => this with { InviteXp = Math.Max(0, InviteXp + amount) },
+            XpSource.Manual => this with { ManualXp = Math.Max(0, ManualXp + amount) },
             _ => throw new ArgumentOutOfRangeException(nameof(source), source, null)
         };
 }
@@ -2603,5 +2837,6 @@ internal enum XpSource
 {
     Message,
     Voice,
-    Invite
+    Invite,
+    Manual
 }

@@ -11,13 +11,14 @@ werden in SQLite gespeichert und bleiben nach einem Neustart erhalten.
 
 ## XP-Konten und Level
 
-Jeder Benutzer besitzt drei getrennte XP-Werte:
+Jeder Benutzer besitzt vier getrennte XP-Werte:
 
 - `MessageXp`
 - `VoiceXp`
 - `InviteXp`
+- `ManualXp`
 
-`TotalXp` ist immer die Summe dieser drei Werte. Ein Benutzer startet mit 0 XP auf Level 0.
+`TotalXp` ist immer die Summe dieser vier Werte. Ein Benutzer startet mit 0 XP auf Level 0.
 Die benötigten XP für das nächste Level werden so berechnet:
 
 ```text
@@ -108,6 +109,26 @@ Jedes Mitglied kann die helle Akzentfarbe seiner Rank-Karte selbst setzen:
 
 Erlaubt sind sechsstellige Hex-Farben. Der Standardwert ist `#FFFFFF`.
 
+### Manuelle XP
+
+Bot-Master koennen XP in einem eigenen manuellen XP-Konto vergeben und wieder entfernen:
+
+```text
+!givexp @user 100 [Grund]
+!removexp @user 100 [Grund]
+```
+
+Diese Befehle veraendern nur `ManualXp`. Nachrichten-, Voice- und Invite-XP bleiben dabei
+unberuehrt; Level und Rang verwenden weiter die Summe aus allen vier XP-Konten.
+
+### `!importdb`
+
+Bot-Master koennen einen oder mehrere `bot-db.json`-Snapshots an eine Nachricht mit
+`!importdb` anhaengen. Der Bot bildet daraus eine Union aller Benutzer. Wenn derselbe
+Benutzer in mehreren Snapshots vorkommt, gewinnt pro XP-Konto jeweils der groesste Wert.
+Beim Import in die aktuelle SQLite-Datenbank wird ebenfalls nie auf niedrigere XP
+zurueckgeschrieben.
+
 ### `!help`
 
 ```text
@@ -193,7 +214,8 @@ ausgewählt. Mit `BotChannel.CreateChannelIfMissing: true` wird er bei Bedarf er
 XP und Rank-Kartenfarben werden zusätzlich als JSON-Snapshot im Textkanal `bot-db`
 gesichert. Kleine Snapshots stehen direkt in einer JSON-Codebox; größere Snapshots werden
 als `bot-db.json` an genau eine Bot-Nachricht angehängt. Ist die lokale SQLite-Datenbank
-leer, stellt der Bot diese Werte beim Start aus dem Discord-Snapshot wieder her.
+niedriger oder leer, merged der Bot diese Werte beim Start aus dem Discord-Snapshot. Pro
+Benutzer und XP-Konto wird dabei immer der größte Wert behalten.
 
 ```json
 "DatabaseChannel": {
@@ -237,6 +259,10 @@ Die Rank-Karten werden mit SkiaSharp gerendert. Dadurch ist unter Linux keine
 `gdiplus.dll` beziehungsweise kein `libgdiplus` mehr erforderlich.
 
 ## Befehle
+
+- `!givexp @user 100 [Grund]` - schreibt XP auf das manuelle XP-Konto
+- `!removexp @user 100 [Grund]` - entfernt XP vom manuellen XP-Konto
+- `!importdb` - importiert angehaengte `bot-db.json`-Snapshots per Max-Merge
 
 - `!help` – zeigt die für den Aufrufer verfügbaren Befehle
 - `!myrank` – sendet die eigene Rank-Karte als Bild

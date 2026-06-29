@@ -18,6 +18,13 @@ public sealed class RankCardRenderer
     private const float AvatarY = 0;
     private const float AvatarSize = 180;
 
+    private const float PlayerTextX = 232;
+    private const float PlayerNameTop = 30;
+    private const float MissingXpTop = 84;
+    private const float RankRightX = 1002;
+    private const float RankBaselineY = 104;
+    private const float TextRankGap = 30;
+
     private static readonly SKColor CardColor = new(5, 7, 12);
     private static readonly SKColor AvatarFallbackColor = new(17, 17, 17);
     private static readonly SKColor TextColor = SKColors.White;
@@ -254,33 +261,28 @@ public sealed class RankCardRenderer
             new TextSegment(data.Level.ToString(CultureInfo.InvariantCulture), rankValueStyle, 0)
         };
 
-        var rankRight = CardX + CardWidth - 58;
         var rankWidth = MeasureSegments(rankSegments);
-        var rankX = rankRight - rankWidth;
-        var rankBaseline = GetCenteredBaseline(
-            CardY + CardHeight / 2,
-            rankValueStyle.Font);
+        var rankX = RankRightX - rankWidth;
 
-        var playerX = CardX + 135;
-        var availableNameWidth = Math.Max(220, rankX - playerX - 24);
+        var availableNameWidth = Math.Max(220, rankX - PlayerTextX - TextRankGap);
         var username = TrimToWidth(data.Username, playerStyle.Font, availableNameWidth);
         DrawTextAtTop(
             canvas,
             username,
-            playerX,
-            CardY + 38,
+            PlayerTextX,
+            PlayerNameTop,
             playerStyle);
 
+        var missingXp = Math.Max(0, data.XpForNextLevel - data.CurrentLevelProgress);
         var xpText =
-            $"{FormatCompact(data.CurrentLevelProgress)} / " +
-            $"{FormatCompact(data.XpForNextLevel)} XP";
-        var availableXpWidth = Math.Max(220, rankX - playerX - 24);
+            $"Noch {FormatCompact(missingXp)} XP";
+        var availableXpWidth = Math.Max(220, rankX - PlayerTextX - TextRankGap);
         xpText = TrimToWidth(xpText, xpStyle.Font, availableXpWidth);
         DrawTextAtTop(
             canvas,
             xpText,
-            playerX,
-            CardY + 98,
+            PlayerTextX,
+            MissingXpTop,
             xpStyle);
 
         var x = rankX;
@@ -289,7 +291,7 @@ public sealed class RankCardRenderer
             canvas.DrawText(
                 segment.Text,
                 x,
-                rankBaseline,
+                RankBaselineY,
                 SKTextAlign.Left,
                 segment.Style.Font,
                 segment.Style.Paint);
