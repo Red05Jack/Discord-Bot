@@ -3049,10 +3049,21 @@ public sealed class DiscordXpBotService : IAsyncDisposable
             return null;
         }
 
-        if (_options.Levels.LevelUpChannelId != 0 &&
-            _guild.GetTextChannel(_options.Levels.LevelUpChannelId) is { } configuredChannel)
+        if (_options.Levels.LevelUpChannelId != 0)
         {
-            return configuredChannel;
+            if (_guild.GetTextChannel(_options.Levels.LevelUpChannelId) is { } configuredChannel)
+            {
+                Console.WriteLine(
+                    $"[{DateTimeOffset.Now:O}] Level-up channel per ID gefunden: " +
+                    $"#{configuredChannel.Name} ({configuredChannel.Id}).");
+                return configuredChannel;
+            }
+
+            throw new InvalidOperationException(
+                $"Der konfigurierte Level-up-Textkanal " +
+                $"{_options.Levels.LevelUpChannelId} wurde nicht gefunden. " +
+                "Pruefe, ob die ID zu einem Textkanal auf diesem Server gehoert " +
+                "und ob der Bot den Kanal sehen darf.");
         }
 
         var existingChannel = _guild.TextChannels.FirstOrDefault(channel =>
@@ -3092,10 +3103,17 @@ public sealed class DiscordXpBotService : IAsyncDisposable
     private async Task NotifyLevelUpAsync(XpMovementResult? movement)
     {
         if (!_options.Levels.Enabled ||
-            _levelUpChannel is null ||
             movement is null ||
             !movement.LeveledUp)
         {
+            return;
+        }
+
+        if (_levelUpChannel is null)
+        {
+            Console.Error.WriteLine(
+                $"[{DateTimeOffset.Now:O}] [LevelUpSend] Kein Level-up-Kanal " +
+                "initialisiert. Pruefe Levels.LevelUpChannelId und Bot-Rechte.");
             return;
         }
 
@@ -3103,11 +3121,29 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         var neededXp = Math.Max(
             0,
             movement.XpForNextLevel - movement.CurrentLevelProgress);
-        await _levelUpChannel.SendMessageAsync(
-            $"""
-            Endlich, <@{movement.UserId}> - {levelUpTitle} - hat Level **{movement.NewLevel:N0}** erreicht!
-            Gesamt-XP: **{movement.NewXp:N0}** | Bis Level {movement.NewLevel + 1:N0}: **{neededXp:N0} XP**
-            """);
+        try
+        {
+            await _levelUpChannel.SendMessageAsync(
+                $"""
+                Endlich, <@{movement.UserId}> - {levelUpTitle} - hat Level **{movement.NewLevel:N0}** erreicht!
+                Gesamt-XP: **{movement.NewXp:N0}** | Bis Level {movement.NewLevel + 1:N0}: **{neededXp:N0} XP**
+                """);
+        }
+        catch (HttpException exception)
+        {
+            Console.Error.WriteLine(
+                $"[{DateTimeOffset.Now:O}] [LevelUpSend] Discord hat die Nachricht " +
+                $"abgelehnt ({exception.HttpCode}). Pruefe im Kanal " +
+                $"#{_levelUpChannel.Name} ({_levelUpChannel.Id}) die Rechte: " +
+                "View Channel, Send Messages und ggf. Embed Links/Attach Files nicht noetig.");
+            return;
+        }
+        catch (Exception exception)
+        {
+            await LogExceptionAsync("LevelUpSend", exception);
+            return;
+        }
+
         if (movement.Applied)
         {
             return;
