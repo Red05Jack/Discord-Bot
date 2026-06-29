@@ -1,17 +1,33 @@
+using System.Globalization;
 using SkiaSharp;
 
 namespace DiscordXpBot.Services;
 
 public sealed class RankCardRenderer
 {
-    private const int Width = 1090;
-    private const int Height = 250;
-    private static readonly SKColor TextColor = new(246, 246, 248);
+    private const int Width = 1062;
+    private const int Height = 180;
+
+    private const float CardX = 80;
+    private const float CardY = 5;
+    private const float CardWidth = 980;
+    private const float CardHeight = 170;
+    private const float CardCornerRadius = 86;
+
+    private const float AvatarX = 2;
+    private const float AvatarY = 0;
+    private const float AvatarSize = 180;
+
+    private static readonly SKColor CardColor = new(5, 7, 12);
+    private static readonly SKColor AvatarFallbackColor = new(17, 17, 17);
+    private static readonly SKColor TextColor = SKColors.White;
     private static readonly SKColor MutedTextColor = new(255, 255, 255, 140);
+
     private static readonly SKTypeface NormalTypeface =
         SKTypeface.FromFamilyName("DejaVu Sans", SKFontStyle.Normal) ??
         SKTypeface.FromFamilyName("Arial", SKFontStyle.Normal) ??
         SKTypeface.Default;
+
     private static readonly SKTypeface BoldTypeface =
         SKTypeface.FromFamilyName("DejaVu Sans", SKFontStyle.Bold) ??
         SKTypeface.FromFamilyName("Arial", SKFontStyle.Bold) ??
@@ -29,10 +45,16 @@ public sealed class RankCardRenderer
         using var canvas = new SKCanvas(bitmap);
         canvas.Clear(SKColors.Transparent);
 
-        DrawBackground(canvas, accent);
-        DrawAvatar(canvas, avatarStream, data.Username, accent);
+        using var cardPath = CreateRightRoundedPath(
+            new SKRect(CardX, CardY, CardX + CardWidth, CardY + CardHeight),
+            CardCornerRadius);
+
+        DrawCardBase(canvas, cardPath);
+        DrawProgressGlow(canvas, cardPath, data.ProgressRatio, accent);
+        DrawReadabilityStrip(canvas);
+        DrawCardBorder(canvas, accent);
         DrawText(canvas, data);
-        DrawProgress(canvas, data.ProgressRatio, accent);
+        DrawAvatar(canvas, avatarStream, data.Username);
 
         using var image = SKImage.FromBitmap(bitmap);
         using var encoded = image.Encode(SKEncodedImageFormat.Png, 100);
@@ -42,77 +64,129 @@ public sealed class RankCardRenderer
         return stream;
     }
 
-    private static void DrawBackground(SKCanvas canvas, SKColor accent)
+    private static void DrawCardBase(SKCanvas canvas, SKPath cardPath)
     {
-        var card = new SKRoundRect(
-            new SKRect(2, 2, Width - 2, Height - 2),
-            20,
-            20);
         using var fill = new SKPaint
         {
             IsAntialias = true,
-            Shader = SKShader.CreateLinearGradient(
-                new SKPoint(0, 0),
-                new SKPoint(Width, 0),
-                [new SKColor(53, 59, 91), new SKColor(21, 23, 31)],
-                null,
-                SKShaderTileMode.Clamp)
+            Color = CardColor,
+            Style = SKPaintStyle.Fill
         };
-        canvas.DrawRoundRect(card, fill);
+        canvas.DrawPath(cardPath, fill);
+    }
 
+    private static void DrawProgressGlow(
+        SKCanvas canvas,
+        SKPath cardPath,
+        double progressRatio,
+        SKColor accent)
+    {
+        var ratio = Math.Clamp(progressRatio, 0, 1);
+        if (ratio <= 0)
+        {
+            return;
+        }
+
+        canvas.Save();
+        canvas.ClipPath(cardPath, SKClipOperation.Intersect, antialias: true);
+
+        using var blur = SKImageFilter.CreateBlur(26, 26);
+        using var glow = new SKPaint
+        {
+            IsAntialias = true,
+            Color = accent.WithAlpha(230),
+            ImageFilter = blur
+        };
+
+        var glowWidth = (float)(CardWidth * ratio);
+        canvas.DrawRect(
+            new SKRect(
+                CardX,
+                CardY - CardHeight,
+                CardX + glowWidth,
+                CardY + CardHeight * 2),
+            glow);
+
+        canvas.Restore();
+    }
+
+    private static void DrawReadabilityStrip(SKCanvas canvas)
+    {
+        using var stripPath = CreateRightRoundedPath(
+            new SKRect(
+                CardX + 72,
+                CardY + 21,
+                CardX + CardWidth - 24,
+                CardY + 143),
+            64);
+        using var stripPaint = new SKPaint
+        {
+            IsAntialias = true,
+            Color = new SKColor(0, 0, 0, 128),
+            Style = SKPaintStyle.Fill
+        };
+        canvas.DrawPath(stripPath, stripPaint);
+    }
+
+    private static void DrawCardBorder(SKCanvas canvas, SKColor accent)
+    {
         using var border = new SKPaint
         {
             IsAntialias = true,
             Color = accent,
             Style = SKPaintStyle.Stroke,
-            StrokeWidth = 4
+            StrokeWidth = 4,
+            StrokeCap = SKStrokeCap.Round,
+            StrokeJoin = SKStrokeJoin.Round
         };
-        canvas.DrawRoundRect(card, border);
+
+        using var borderPath = new SKPath();
+        var left = CardX;
+        var top = CardY + 2;
+        var right = CardX + CardWidth - 2;
+        var bottom = CardY + CardHeight - 2;
+        var radius = CardCornerRadius - 2;
+
+        borderPath.MoveTo(left, top);
+        borderPath.LineTo(right - radius, top);
+        borderPath.ArcTo(
+            new SKRect(right - radius * 2, top, right, top + radius * 2),
+            -90,
+            90,
+            false);
+        borderPath.LineTo(right, bottom - radius);
+        borderPath.ArcTo(
+            new SKRect(right - radius * 2, bottom - radius * 2, right, bottom),
+            0,
+            90,
+            false);
+        borderPath.LineTo(left, bottom);
+
+        canvas.DrawPath(borderPath, border);
     }
 
     private static void DrawAvatar(
         SKCanvas canvas,
         Stream? avatarStream,
-        string username,
-        SKColor accent)
+        string username)
     {
-        const float outerX = 18;
-        const float outerY = 18;
-        const float outerSize = 190;
-        const float innerX = 34;
-        const float innerY = 34;
-        const float innerSize = 158;
-
         using var background = new SKPaint
         {
             IsAntialias = true,
-            Color = new SKColor(17, 19, 26)
+            Color = AvatarFallbackColor
         };
         canvas.DrawCircle(
-            outerX + outerSize / 2,
-            outerY + outerSize / 2,
-            outerSize / 2,
+            AvatarX + AvatarSize / 2,
+            AvatarY + AvatarSize / 2,
+            AvatarSize / 2,
             background);
-
-        using var border = new SKPaint
-        {
-            IsAntialias = true,
-            Color = accent,
-            Style = SKPaintStyle.Stroke,
-            StrokeWidth = 6
-        };
-        canvas.DrawCircle(
-            outerX + outerSize / 2,
-            outerY + outerSize / 2,
-            outerSize / 2 - 3,
-            border);
 
         canvas.Save();
         using var clip = new SKPath();
         clip.AddCircle(
-            innerX + innerSize / 2,
-            innerY + innerSize / 2,
-            innerSize / 2);
+            AvatarX + AvatarSize / 2,
+            AvatarY + AvatarSize / 2,
+            AvatarSize / 2);
         canvas.ClipPath(clip, SKClipOperation.Intersect, antialias: true);
 
         using var avatar = TryDecodeAvatar(avatarStream);
@@ -120,10 +194,10 @@ public sealed class RankCardRenderer
         {
             var source = GetCenteredSquare(avatar.Width, avatar.Height);
             var destination = new SKRect(
-                innerX,
-                innerY,
-                innerX + innerSize,
-                innerY + innerSize);
+                AvatarX,
+                AvatarY,
+                AvatarX + AvatarSize,
+                AvatarY + AvatarSize);
             using var imagePaint = new SKPaint { IsAntialias = true };
             canvas.DrawBitmap(avatar, source, destination, imagePaint);
         }
@@ -133,16 +207,16 @@ public sealed class RankCardRenderer
             {
                 IsAntialias = true,
                 Shader = SKShader.CreateLinearGradient(
-                    new SKPoint(innerX, innerY),
-                    new SKPoint(innerX + innerSize, innerY + innerSize),
-                    [new SKColor(67, 74, 112), new SKColor(24, 27, 39)],
+                    new SKPoint(AvatarX, AvatarY),
+                    new SKPoint(AvatarX + AvatarSize, AvatarY + AvatarSize),
+                    [new SKColor(45, 48, 65), new SKColor(12, 14, 20)],
                     null,
                     SKShaderTileMode.Clamp)
             };
             canvas.DrawCircle(
-                innerX + innerSize / 2,
-                innerY + innerSize / 2,
-                innerSize / 2,
+                AvatarX + AvatarSize / 2,
+                AvatarY + AvatarSize / 2,
+                AvatarSize / 2,
                 fallback);
 
             var initial = string.IsNullOrWhiteSpace(username)
@@ -152,10 +226,10 @@ public sealed class RankCardRenderer
             var width = initialStyle.Font.MeasureText(initial);
             var metrics = initialStyle.Font.Metrics;
             var baseline =
-                innerY + innerSize / 2 - (metrics.Ascent + metrics.Descent) / 2;
+                AvatarY + AvatarSize / 2 - (metrics.Ascent + metrics.Descent) / 2;
             canvas.DrawText(
                 initial,
-                innerX + (innerSize - width) / 2,
+                AvatarX + (AvatarSize - width) / 2,
                 baseline,
                 SKTextAlign.Left,
                 initialStyle.Font,
@@ -167,90 +241,60 @@ public sealed class RankCardRenderer
 
     private static void DrawText(SKCanvas canvas, RankCardData data)
     {
-        using var playerStyle = CreateTextStyle(38, bold: true, TextColor);
-        using var labelStyle = CreateTextStyle(29, bold: false, MutedTextColor);
-        using var valueStyle = CreateTextStyle(66, bold: false, TextColor);
-        using var xpStyle = CreateTextStyle(31, bold: false, MutedTextColor);
+        using var playerStyle = CreateTextStyle(42, bold: true, TextColor);
+        using var xpStyle = CreateTextStyle(32, bold: false, MutedTextColor);
+        using var rankLabelStyle = CreateTextStyle(30, bold: false, MutedTextColor);
+        using var rankValueStyle = CreateTextStyle(44, bold: true, TextColor);
 
-        var username = TrimToWidth(data.Username, playerStyle.Font, 430);
-        canvas.DrawText(
-            username,
-            278,
-            140,
-            SKTextAlign.Left,
-            playerStyle.Font,
-            playerStyle.Paint);
-
-        var segments = new[]
+        var rankSegments = new[]
         {
-            new TextSegment("RANG", labelStyle, 16),
-            new TextSegment($"#{data.Rank}", valueStyle, 16),
-            new TextSegment("LEVEL", labelStyle, 16),
-            new TextSegment(data.Level.ToString(), valueStyle, 0)
+            new TextSegment("RANG", rankLabelStyle, 8),
+            new TextSegment($"#{data.Rank}", rankValueStyle, 8),
+            new TextSegment("LEVEL", rankLabelStyle, 8),
+            new TextSegment(data.Level.ToString(CultureInfo.InvariantCulture), rankValueStyle, 0)
         };
-        var totalWidth = segments.Sum(segment =>
-            segment.Style.Font.MeasureText(segment.Text) + segment.Gap);
-        var x = Width - 24 - totalWidth;
-        foreach (var segment in segments)
+
+        var rankRight = CardX + CardWidth - 58;
+        var rankWidth = MeasureSegments(rankSegments);
+        var rankX = rankRight - rankWidth;
+        var rankBaseline = GetCenteredBaseline(
+            CardY + CardHeight / 2,
+            rankValueStyle.Font);
+
+        var playerX = CardX + 135;
+        var availableNameWidth = Math.Max(220, rankX - playerX - 24);
+        var username = TrimToWidth(data.Username, playerStyle.Font, availableNameWidth);
+        DrawTextAtTop(
+            canvas,
+            username,
+            playerX,
+            CardY + 38,
+            playerStyle);
+
+        var xpText =
+            $"{FormatCompact(data.CurrentLevelProgress)} / " +
+            $"{FormatCompact(data.XpForNextLevel)} XP";
+        var availableXpWidth = Math.Max(220, rankX - playerX - 24);
+        xpText = TrimToWidth(xpText, xpStyle.Font, availableXpWidth);
+        DrawTextAtTop(
+            canvas,
+            xpText,
+            playerX,
+            CardY + 98,
+            xpStyle);
+
+        var x = rankX;
+        foreach (var segment in rankSegments)
         {
-            var baseline = segment.Style.Font.Size >= 60 ? 76 : 63;
             canvas.DrawText(
                 segment.Text,
                 x,
-                baseline,
+                rankBaseline,
                 SKTextAlign.Left,
                 segment.Style.Font,
                 segment.Style.Paint);
             x += segment.Style.Font.MeasureText(segment.Text) + segment.Gap;
         }
-
-        var xpText =
-            $"{FormatCompact(data.CurrentLevelProgress)} / " +
-            $"{FormatCompact(data.XpForNextLevel)} XP";
-        canvas.DrawText(
-            xpText,
-            Width - 24 - xpStyle.Font.MeasureText(xpText),
-            143,
-            SKTextAlign.Left,
-            xpStyle.Font,
-            xpStyle.Paint);
-    }
-
-    private static void DrawProgress(
-        SKCanvas canvas,
-        double progressRatio,
-        SKColor accent)
-    {
-        var outer = new SKRoundRect(
-            new SKRect(268, 158, 1062, 216),
-            18,
-            18);
-        using var border = new SKPaint
-        {
-            IsAntialias = true,
-            Color = accent,
-            Style = SKPaintStyle.Stroke,
-            StrokeWidth = 4
-        };
-        canvas.DrawRoundRect(outer, border);
-
-        var ratio = Math.Clamp(progressRatio, 0, 1);
-        var fillWidth = (float)((outer.Rect.Width - 10) * ratio);
-        if (fillWidth <= 0)
-        {
-            return;
-        }
-
-        var fill = new SKRoundRect(
-            new SKRect(273, 163, 273 + fillWidth, 211),
-            Math.Min(10, fillWidth / 2),
-            Math.Min(10, fillWidth / 2));
-        using var fillPaint = new SKPaint
-        {
-            IsAntialias = true,
-            Color = accent
-        };
-        canvas.DrawRoundRect(fill, fillPaint);
     }
 
     private static TextStyle CreateTextStyle(
@@ -266,6 +310,33 @@ public sealed class RankCardRenderer
         };
         return new TextStyle(font, paint);
     }
+
+    private static void DrawTextAtTop(
+        SKCanvas canvas,
+        string text,
+        float x,
+        float top,
+        TextStyle style)
+    {
+        var baseline = top - style.Font.Metrics.Ascent;
+        canvas.DrawText(
+            text,
+            x,
+            baseline,
+            SKTextAlign.Left,
+            style.Font,
+            style.Paint);
+    }
+
+    private static float GetCenteredBaseline(float centerY, SKFont font)
+    {
+        var metrics = font.Metrics;
+        return centerY - (metrics.Ascent + metrics.Descent) / 2;
+    }
+
+    private static float MeasureSegments(IEnumerable<TextSegment> segments) =>
+        segments.Sum(segment =>
+            segment.Style.Font.MeasureText(segment.Text) + segment.Gap);
 
     private static SKBitmap? TryDecodeAvatar(Stream? avatarStream)
     {
@@ -293,6 +364,22 @@ public sealed class RankCardRenderer
         return new SKRect(left, top, left + size, top + size);
     }
 
+    private static SKPath CreateRightRoundedPath(SKRect rect, float radius)
+    {
+        var path = new SKPath();
+        using var roundRect = new SKRoundRect();
+        roundRect.SetRectRadii(
+            rect,
+            [
+                new SKPoint(0, 0),
+                new SKPoint(radius, radius),
+                new SKPoint(radius, radius),
+                new SKPoint(0, 0)
+            ]);
+        path.AddRoundRect(roundRect);
+        return path;
+    }
+
     private static string TrimToWidth(
         string value,
         SKFont font,
@@ -303,14 +390,15 @@ public sealed class RankCardRenderer
             return value;
         }
 
+        const string suffix = "...";
         var trimmed = value;
         while (trimmed.Length > 1 &&
-               font.MeasureText($"{trimmed}…") > maxWidth)
+               font.MeasureText($"{trimmed}{suffix}") > maxWidth)
         {
             trimmed = trimmed[..^1];
         }
 
-        return $"{trimmed}…";
+        return $"{trimmed}{suffix}";
     }
 
     private static SKColor ParseColor(string value)
@@ -327,9 +415,9 @@ public sealed class RankCardRenderer
     {
         return value switch
         {
-            >= 1_000_000 => $"{value / 1_000_000d:0.##}M",
-            >= 1_000 => $"{value / 1_000d:0.##}K",
-            _ => value.ToString("N0")
+            >= 1_000_000 => $"{(value / 1_000_000d).ToString("0.##", CultureInfo.InvariantCulture)}M",
+            >= 1_000 => $"{(value / 1_000d).ToString("0.##", CultureInfo.InvariantCulture)}K",
+            _ => value.ToString("N0", CultureInfo.InvariantCulture)
         };
     }
 
