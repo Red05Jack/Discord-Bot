@@ -1127,17 +1127,21 @@ public sealed class BotDatabase
                           .Select(MergePersistentProfiles))
             {
                 var importTotals = new XpSourceTotals(
-                    Math.Max(0, profile.MessageXp),
-                    Math.Max(0, profile.VoiceXp),
-                    Math.Max(0, profile.InviteXp),
-                    Math.Max(0, profile.ManualXp));
-                currentTotals.TryGetValue(profile.UserId, out var oldTotals);
+                    profile.MessageXp,
+                    profile.VoiceXp,
+                    profile.InviteXp,
+                    profile.ManualXp);
+                var hasCurrentTotals = currentTotals.TryGetValue(
+                    profile.UserId,
+                    out var oldTotals);
                 oldTotals ??= new XpSourceTotals();
-                var newTotals = new XpSourceTotals(
-                    Math.Max(oldTotals.MessageXp, importTotals.MessageXp),
-                    Math.Max(oldTotals.VoiceXp, importTotals.VoiceXp),
-                    Math.Max(oldTotals.InviteXp, importTotals.InviteXp),
-                    Math.Max(oldTotals.ManualXp, importTotals.ManualXp));
+                var newTotals = hasCurrentTotals
+                    ? new XpSourceTotals(
+                        Math.Max(oldTotals.MessageXp, importTotals.MessageXp),
+                        Math.Max(oldTotals.VoiceXp, importTotals.VoiceXp),
+                        Math.Max(oldTotals.InviteXp, importTotals.InviteXp),
+                        Math.Max(oldTotals.ManualXp, importTotals.ManualXp))
+                    : importTotals;
 
                 await using (var preference = connection.CreateCommand())
                 {
@@ -1161,10 +1165,9 @@ public sealed class BotDatabase
 
                 await using (var baseline = connection.CreateCommand())
                 {
-                    var messageBaseline = Math.Max(
-                        0,
+                    var messageBaseline =
                         newTotals.MessageXp -
-                        recordedMessageXp.GetValueOrDefault(profile.UserId));
+                        recordedMessageXp.GetValueOrDefault(profile.UserId);
                     baseline.Transaction = transaction;
                     baseline.CommandText =
                         """
@@ -1194,41 +1197,45 @@ public sealed class BotDatabase
                     continue;
                 }
 
-                var cumulativeXp = oldTotals.TotalXp;
+                var runningTotals = oldTotals;
                 foreach (var source in new[]
                           {
                               (
+                                  Source: XpSource.Message,
                                   Amount: newTotals.MessageXp - oldTotals.MessageXp,
                                   NewValue: newTotals.MessageXp,
                                   Reason: "message-snapshot"
                               ),
                               (
+                                  Source: XpSource.Voice,
                                   Amount: newTotals.VoiceXp - oldTotals.VoiceXp,
                                   NewValue: newTotals.VoiceXp,
                                   Reason: "voice-snapshot"
                               ),
                               (
+                                  Source: XpSource.Invite,
                                   Amount: newTotals.InviteXp - oldTotals.InviteXp,
                                   NewValue: newTotals.InviteXp,
                                   Reason: "invite-snapshot"
                               ),
                               (
+                                  Source: XpSource.Manual,
                                   Amount: newTotals.ManualXp - oldTotals.ManualXp,
                                   NewValue: newTotals.ManualXp,
                                   Reason: "manual-snapshot"
                               )
                           })
                 {
-                    if (source.Amount <= 0)
+                    if (source.Amount == 0)
                     {
                         continue;
                     }
 
                     var oldState =
-                        LevelCalculator.CalculateLevelFromTotalXp(cumulativeXp);
-                    cumulativeXp += source.Amount;
+                        LevelCalculator.CalculateLevelFromTotalXp(runningTotals.TotalXp);
+                    runningTotals = runningTotals.Apply(source.Source, checked((int)source.Amount));
                     var newState =
-                        LevelCalculator.CalculateLevelFromTotalXp(cumulativeXp);
+                        LevelCalculator.CalculateLevelFromTotalXp(runningTotals.TotalXp);
                     await InsertXpMovementLogAsync(
                         connection,
                         transaction,
@@ -1567,7 +1574,7 @@ public sealed class BotDatabase
                 var newTotals = oldTotals with { MessageXp = newMessageXp };
                 var oldState = LevelCalculator.CalculateLevelFromTotalXp(oldTotals.TotalXp);
                 var newState = LevelCalculator.CalculateLevelFromTotalXp(newTotals.TotalXp);
-                var amount = checked((int)(newTotals.TotalXp - oldTotals.TotalXp));
+                var amount = checked((int)(newTotals.MessageXp - oldTotals.MessageXp));
 
                 if (amount != 0)
                 {
@@ -2032,7 +2039,6 @@ public sealed class BotDatabase
             var oldXp = totals.TotalXp;
             totals = totals.Apply(ResolveXpSource(movement.Reason), movement.Amount);
             var newXp = totals.TotalXp;
-            var effectiveAmount = checked((int)(newXp - oldXp));
             var oldState = LevelCalculator.CalculateLevelFromTotalXp(oldXp);
             var newState = LevelCalculator.CalculateLevelFromTotalXp(newXp);
 
@@ -2041,14 +2047,12 @@ public sealed class BotDatabase
             update.CommandText =
                 """
                 UPDATE internal_xp_ledger
-                SET amount = $amount,
-                    old_xp = $oldXp,
+                SET old_xp = $oldXp,
                     new_xp = $newXp,
                     old_level = $oldLevel,
                     new_level = $newLevel
                 WHERE id = $id;
                 """;
-            AddParameter(update, "$amount", effectiveAmount);
             AddParameter(update, "$oldXp", oldXp);
             AddParameter(update, "$newXp", newXp);
             AddParameter(update, "$oldLevel", oldState.Level);
@@ -2179,7 +2183,7 @@ public sealed class BotDatabase
             var newTotals = oldTotals with { MessageXp = authoritativeMessageXp };
             var oldState = LevelCalculator.CalculateLevelFromTotalXp(oldTotals.TotalXp);
             var newState = LevelCalculator.CalculateLevelFromTotalXp(newTotals.TotalXp);
-            var amount = checked((int)(newTotals.TotalXp - oldTotals.TotalXp));
+            var amount = checked((int)(newTotals.MessageXp - oldTotals.MessageXp));
             var timestamp = DateTimeOffset.UtcNow;
 
             await InsertXpMovementLogAsync(
@@ -2241,32 +2245,14 @@ public sealed class BotDatabase
             }
         }
 
-        var oldXp = oldMessageXp + oldVoiceXp + oldInviteXp + oldManualXp;
-        var newMessageXp = oldMessageXp;
-        var newVoiceXp = oldVoiceXp;
-        var newInviteXp = oldInviteXp;
-        var newManualXp = oldManualXp;
-
-        switch (source)
-        {
-            case XpSource.Message:
-                newMessageXp = Math.Max(0, oldMessageXp + amount);
-                break;
-            case XpSource.Voice:
-                newVoiceXp = Math.Max(0, oldVoiceXp + amount);
-                break;
-            case XpSource.Invite:
-                newInviteXp = Math.Max(0, oldInviteXp + amount);
-                break;
-            case XpSource.Manual:
-                newManualXp = Math.Max(0, oldManualXp + amount);
-                break;
-            default:
-                throw new ArgumentOutOfRangeException(nameof(source), source, null);
-        }
-
-        var newXp = newMessageXp + newVoiceXp + newInviteXp + newManualXp;
-        var effectiveAmount = checked((int)(newXp - oldXp));
+        var oldTotals = new XpSourceTotals(
+            oldMessageXp,
+            oldVoiceXp,
+            oldInviteXp,
+            oldManualXp);
+        var newTotals = oldTotals.Apply(source, amount);
+        var oldXp = oldTotals.TotalXp;
+        var newXp = newTotals.TotalXp;
         var oldState = LevelCalculator.CalculateLevelFromTotalXp(oldXp);
         var newState = LevelCalculator.CalculateLevelFromTotalXp(newXp);
 
@@ -2275,7 +2261,7 @@ public sealed class BotDatabase
             transaction,
             guildId,
             userId,
-            effectiveAmount,
+            amount,
             reason,
             referenceId,
             nowUtc,
@@ -2297,13 +2283,13 @@ public sealed class BotDatabase
             transaction,
             guildId,
             userId,
-            new XpSourceTotals(newMessageXp, newVoiceXp, newInviteXp, newManualXp),
+            newTotals,
             newState);
         return new XpMovementResult(
             true,
             guildId,
             userId,
-            effectiveAmount,
+            amount,
             reason,
             referenceId,
             nowUtc,
@@ -2501,10 +2487,6 @@ public sealed class BotDatabase
         {
             var normalized = profile with
             {
-                MessageXp = Math.Max(0, profile.MessageXp),
-                VoiceXp = Math.Max(0, profile.VoiceXp),
-                InviteXp = Math.Max(0, profile.InviteXp),
-                ManualXp = Math.Max(0, profile.ManualXp),
                 RankColor = NormalizeStoredRankColor(profile.RankColor)
             };
             merged = merged is null
@@ -2749,7 +2731,8 @@ public sealed record PersistentUserProfile(
     string RankColor,
     long ManualXp = 0)
 {
-    public long TotalXp => MessageXp + VoiceXp + InviteXp + ManualXp;
+    public long RawTotalXp => MessageXp + VoiceXp + InviteXp + ManualXp;
+    public long TotalXp => Math.Max(0, RawTotalXp);
 }
 
 public sealed record PersistentRestoreResult(
@@ -2820,15 +2803,16 @@ internal sealed record XpSourceTotals(
     long InviteXp = 0,
     long ManualXp = 0)
 {
-    public long TotalXp => MessageXp + VoiceXp + InviteXp + ManualXp;
+    public long RawTotalXp => MessageXp + VoiceXp + InviteXp + ManualXp;
+    public long TotalXp => Math.Max(0, RawTotalXp);
 
     public XpSourceTotals Apply(XpSource source, int amount) =>
         source switch
         {
-            XpSource.Message => this with { MessageXp = Math.Max(0, MessageXp + amount) },
-            XpSource.Voice => this with { VoiceXp = Math.Max(0, VoiceXp + amount) },
-            XpSource.Invite => this with { InviteXp = Math.Max(0, InviteXp + amount) },
-            XpSource.Manual => this with { ManualXp = Math.Max(0, ManualXp + amount) },
+            XpSource.Message => this with { MessageXp = MessageXp + amount },
+            XpSource.Voice => this with { VoiceXp = VoiceXp + amount },
+            XpSource.Invite => this with { InviteXp = InviteXp + amount },
+            XpSource.Manual => this with { ManualXp = ManualXp + amount },
             _ => throw new ArgumentOutOfRangeException(nameof(source), source, null)
         };
 }

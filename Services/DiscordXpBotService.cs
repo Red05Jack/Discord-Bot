@@ -3022,13 +3022,13 @@ public sealed class DiscordXpBotService : IAsyncDisposable
     private static PersistentUserProfile ToPersistentProfile(
         DiscordDatabaseUser user)
     {
-        var messageXp = Math.Max(0, user.MessageXp);
-        var voiceXp = Math.Max(0, user.VoiceXp);
-        var inviteXp = Math.Max(0, user.InviteXp);
-        var manualXp = Math.Max(0, user.ManualXp);
+        var messageXp = user.MessageXp;
+        var voiceXp = user.VoiceXp;
+        var inviteXp = user.InviteXp;
+        var manualXp = user.ManualXp ?? 0;
         var sourceTotal = messageXp + voiceXp + inviteXp + manualXp;
         var storedTotal = Math.Max(0, user.TotalXp);
-        if (storedTotal > sourceTotal)
+        if (user.ManualXp is null && storedTotal > sourceTotal)
         {
             manualXp += storedTotal - sourceTotal;
         }
@@ -3282,7 +3282,7 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         public long VoiceXp { get; init; }
         public long InviteXp { get; init; }
         public string RankColor { get; init; } = "#FFFFFF";
-        public long ManualXp { get; init; }
+        public long? ManualXp { get; init; }
     }
 
     private sealed record MessageChannelProgress(

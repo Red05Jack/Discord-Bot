@@ -146,21 +146,32 @@ try
                 VoiceXp: 0,
                 InviteXp: 0,
                 RankColor: "#111111",
-                ManualXp: 5)
+                ManualXp: 5),
+            new PersistentUserProfile(
+                779,
+                MessageXp: 10,
+                VoiceXp: 0,
+                InviteXp: 0,
+                RankColor: "#222222",
+                ManualXp: -50)
         ],
         now.AddMinutes(1));
     var mergedAccount = await reopenedSnapshotDatabase.GetInternalXpAccountAsync(guildId, 777);
     var importedAccount = await reopenedSnapshotDatabase.GetInternalXpAccountAsync(guildId, 778);
+    var negativeImportedAccount = await reopenedSnapshotDatabase.GetInternalXpAccountAsync(guildId, 779);
     Assert(
         mergeResult.XpRestoreApplied &&
-        mergeResult.RestoredXpUsers == 2 &&
+        mergeResult.RestoredXpUsers == 3 &&
         mergedAccount.MessageXp == 120 &&
         mergedAccount.VoiceXp == 80 &&
         mergedAccount.InviteXp == 800 &&
         mergedAccount.ManualXp == 45 &&
         mergedAccount.TotalXp == 1045 &&
         importedAccount.TotalXp == 15 &&
-        importedAccount.ManualXp == 5,
+        importedAccount.ManualXp == 5 &&
+        negativeImportedAccount.MessageXp == 10 &&
+        negativeImportedAccount.ManualXp == -50 &&
+        negativeImportedAccount.TotalXp == 0,
         "Der Snapshot-Merge hat nicht pro Benutzer und XP-Topf den jeweils groessten Wert behalten.");
 
     var invite = new InviteRewardRecord(
@@ -563,7 +574,7 @@ try
     var manualRemoval = await database.RemoveManualXpAsync(
         guildId,
         sourceUserId,
-        30,
+        130,
         "manual-remove:self-test",
         "manual-remove:self-test",
         now.AddMinutes(3));
@@ -571,13 +582,30 @@ try
         .Single(entry => entry.UserId == sourceUserId);
     Assert(
         manualGrant.Amount == 80 &&
-        manualRemoval.Amount == -30 &&
+        manualRemoval.Amount == -130 &&
         sourceEntry.MessageXp == 0 &&
         sourceEntry.VoiceXp == 100 &&
         sourceEntry.InviteXp == 200 &&
-        sourceEntry.ManualXp == 50 &&
-        sourceEntry.TotalXp == 350,
-        "Manuelle XP wurden nicht separat vergeben oder entfernt.");
+        sourceEntry.ManualXp == -50 &&
+        sourceEntry.TotalXp == 250,
+        "Manuelle XP wurden nicht separat vergeben, entfernt oder negativ gespeichert.");
+
+    const ulong negativeOnlyUserId = 751;
+    await database.RemoveManualXpAsync(
+        guildId,
+        negativeOnlyUserId,
+        500,
+        "manual-remove:negative-self-test",
+        "manual-remove:negative-self-test",
+        now.AddMinutes(4));
+    var negativeOnlyEntry = await database.GetInternalXpAccountAsync(
+        guildId,
+        negativeOnlyUserId);
+    Assert(
+        negativeOnlyEntry.ManualXp == -500 &&
+        negativeOnlyEntry.TotalXp == 0 &&
+        negativeOnlyEntry.CurrentLevel == 0,
+        "Negative manuelle XP haben Gesamt-XP oder Level unter 0 gedrueckt.");
 
     var reopenedDatabase = new BotDatabase(databasePath);
     await reopenedDatabase.InitializeAsync();
@@ -588,10 +616,10 @@ try
         persistedSourceEntry.MessageXp == 0 &&
         persistedSourceEntry.VoiceXp == 100 &&
         persistedSourceEntry.InviteXp == 200 &&
-        persistedSourceEntry.ManualXp == 50 &&
-        persistedSourceEntry.TotalXp == 350 &&
+        persistedSourceEntry.ManualXp == -50 &&
+        persistedSourceEntry.TotalXp == 250 &&
         persistedSourceEntry.CurrentLevel ==
-        LevelCalculator.CalculateLevelFromTotalXp(350).Level,
+        LevelCalculator.CalculateLevelFromTotalXp(250).Level,
         "XP-Töpfe oder Level wurden nach einem Datenbank-Neustart nicht wiederhergestellt.");
 
     const ulong levelUserId = 900;
@@ -624,7 +652,7 @@ try
     Assert(
         clampedRemoval.NewXp == 0 &&
         clampedRemoval.NewLevel == 0 &&
-        clampedRemoval.Amount == -largeReward,
+        clampedRemoval.Amount == -(largeReward + 10_000),
         "RemoveXp hat XP nicht bei 0 begrenzt.");
 
     var movementLog = await database.GetXpMovementLogAsync(guildId, levelUserId);

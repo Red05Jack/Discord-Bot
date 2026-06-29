@@ -119,7 +119,8 @@ Bot-Master koennen XP in einem eigenen manuellen XP-Konto vergeben und wieder en
 ```
 
 Diese Befehle veraendern nur `ManualXp`. Nachrichten-, Voice- und Invite-XP bleiben dabei
-unberuehrt; Level und Rang verwenden weiter die Summe aus allen vier XP-Konten.
+unberuehrt. Einzelne XP-Konten duerfen negativ werden; Level und Rang verwenden die Summe
+aus allen vier XP-Konten, wobei nur die Gesamt-XP bei 0 gekappt wird.
 
 ### `!importdb`
 
