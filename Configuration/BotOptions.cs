@@ -113,6 +113,19 @@ public sealed class BotOptions
                 "Voice.RewardBlockMinutes muss größer als 0 sein.");
         }
 
+        ValidatePositiveDouble(
+            Voice.SingleUserMultiplier,
+            "Voice.SingleUserMultiplier");
+        ValidateNonNegativeDouble(
+            Voice.MultiUserLogBonus,
+            "Voice.MultiUserLogBonus");
+        if (!double.IsFinite(Voice.StreamMultiplier) ||
+            Voice.StreamMultiplier < 1)
+        {
+            throw new InvalidOperationException(
+                "Voice.StreamMultiplier muss groesser oder gleich 1 sein.");
+        }
+
         if (BotChannel.Enabled)
         {
             if (BotChannel.ChannelId == 0 &&
@@ -152,6 +165,22 @@ public sealed class BotOptions
         }
     }
 
+    private static void ValidatePositiveDouble(double value, string name)
+    {
+        if (!double.IsFinite(value) || value <= 0)
+        {
+            throw new InvalidOperationException($"{name} muss groesser als 0 sein.");
+        }
+    }
+
+    private static void ValidateNonNegativeDouble(double value, string name)
+    {
+        if (!double.IsFinite(value) || value < 0)
+        {
+            throw new InvalidOperationException($"{name} darf nicht negativ sein.");
+        }
+    }
+
     private static void ValidateRange(int min, int max, string minName, string maxName)
     {
         if (min < 0 || max < min)
@@ -188,6 +217,9 @@ public sealed class VoiceXpOptions
     public int MaxXpPerFiveMinutes { get; set; } = 15;
     public int RewardBlockMinutes { get; set; } = 5;
     public double CheckpointIntervalMinutes { get; set; }
+    public double SingleUserMultiplier { get; set; } = 0.5;
+    public double MultiUserLogBonus { get; set; } = 0.25;
+    public double StreamMultiplier { get; set; } = 1.25;
     public bool RewardBots { get; set; }
     public List<ulong> EligibleChannelIds { get; set; } = [];
     public List<ulong> ExcludedChannelIds { get; set; } = [];

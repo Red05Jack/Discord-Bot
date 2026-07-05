@@ -398,6 +398,16 @@ public sealed class DiscordXpBotService : IAsyncDisposable
         {
             if (IsEligibleVoiceChannel(beforeChannel))
             {
+                var participantCount = CountRewardableUsersInVoiceChannel(beforeChannel, guildUser);
+                var xpMultiplier = CalculateVoiceXpMultiplier(
+                    participantCount,
+                    before.IsStreaming);
+                LogVoiceXpMultiplier(
+                    guildUser,
+                    beforeChannel,
+                    participantCount,
+                    before.IsStreaming,
+                    xpMultiplier);
                 var reward = await _database.RewardVoiceTimeAsync(
                     guildUser.Guild.Id,
                     user.Id,
@@ -405,7 +415,8 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                     _options.Voice.MinXpPerFiveMinutes,
                     _options.Voice.MaxXpPerFiveMinutes,
                     _options.Voice.RewardBlockMinutes,
-                    deleteSession: true);
+                    deleteSession: true,
+                    xpMultiplier: xpMultiplier);
 
                 LogXpMovement(reward.Movement);
                 await NotifyLevelUpAsync(reward.Movement);
@@ -1726,6 +1737,9 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                 (!user.IsBot || _options.Voice.RewardBots) &&
                 IsEligibleVoiceChannel(user.VoiceChannel))
             .ToArray();
+        var usersByChannel = activeUsers
+            .GroupBy(user => user.VoiceChannel!.Id)
+            .ToDictionary(group => group.Key, group => group.Count());
 
         if (_options.Debug.Enabled)
         {
@@ -1751,6 +1765,18 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                         $"Kanal={user.VoiceChannel.Name} ({user.VoiceChannel.Id})");
                 }
 
+                var participantCount = usersByChannel.GetValueOrDefault(
+                    user.VoiceChannel!.Id,
+                    1);
+                var xpMultiplier = CalculateVoiceXpMultiplier(
+                    participantCount,
+                    user.IsStreaming);
+                LogVoiceXpMultiplier(
+                    user,
+                    user.VoiceChannel,
+                    participantCount,
+                    user.IsStreaming,
+                    xpMultiplier);
                 var reward = await _database.RewardVoiceTimeAsync(
                     _guild.Id,
                     user.Id,
@@ -1758,7 +1784,8 @@ public sealed class DiscordXpBotService : IAsyncDisposable
                     _options.Voice.MinXpPerFiveMinutes,
                     _options.Voice.MaxXpPerFiveMinutes,
                     _options.Voice.RewardBlockMinutes,
-                    deleteSession: false);
+                    deleteSession: false,
+                    xpMultiplier: xpMultiplier);
 
                 LogXpMovement(reward.Movement);
                 await NotifyLevelUpAsync(reward.Movement);
@@ -1783,6 +1810,70 @@ public sealed class DiscordXpBotService : IAsyncDisposable
 
         return _options.Voice.EligibleChannelIds.Count == 0 ||
                _options.Voice.EligibleChannelIds.Contains(channel.Id);
+    }
+
+    private int CountRewardableUsersInVoiceChannel(
+        SocketVoiceChannel? channel,
+        SocketGuildUser currentUser)
+    {
+        if (channel is null || _guild is null)
+        {
+            return 1;
+        }
+
+        var count = _guild.Users.Count(user =>
+            user.VoiceChannel?.Id == channel.Id &&
+            (!user.IsBot || _options.Voice.RewardBots) &&
+            IsEligibleVoiceChannel(user.VoiceChannel));
+        if (currentUser.VoiceChannel?.Id != channel.Id &&
+            (!currentUser.IsBot || _options.Voice.RewardBots))
+        {
+            count++;
+        }
+
+        return Math.Max(1, count);
+    }
+
+    private double CalculateVoiceXpMultiplier(int participantCount, bool isStreaming)
+    {
+        var participantMultiplier = participantCount switch
+        {
+            <= 1 => _options.Voice.SingleUserMultiplier,
+            2 => 1.0,
+            _ => 1.0 + Math.Log(participantCount - 1, 2) * _options.Voice.MultiUserLogBonus
+        };
+
+        return isStreaming
+            ? participantMultiplier * _options.Voice.StreamMultiplier
+            : participantMultiplier;
+    }
+
+    private void LogVoiceXpMultiplier(
+        SocketGuildUser user,
+        SocketVoiceChannel? channel,
+        int participantCount,
+        bool isStreaming,
+        double xpMultiplier)
+    {
+        if (!_options.Debug.Enabled)
+        {
+            return;
+        }
+
+        Console.WriteLine(
+            $"[{DateTimeOffset.Now:O}] [DEBUG] [VOICE-XP-PROZENT] " +
+            $"User={user.DisplayName} ({user.Id}) | " +
+            $"Kanal={FormatVoiceChannel(channel)} | " +
+            $"VC-User={participantCount} | " +
+            $"Stream={(isStreaming ? "ja" : "nein")} | " +
+            $"XP-Prozent={FormatPercent(xpMultiplier)}");
+    }
+
+    private static string FormatPercent(double multiplier)
+    {
+        return string.Create(
+            CultureInfo.InvariantCulture,
+            $"{multiplier * 100:0.##}%");
     }
 
     private async Task AnnounceVoiceRewardAsync(ulong userId, VoiceRewardResult reward)

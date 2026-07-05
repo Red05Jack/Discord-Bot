@@ -775,8 +775,16 @@ public sealed class BotDatabase
         int minXpPerBlock,
         int maxXpPerBlock,
         int rewardBlockMinutes,
-        bool deleteSession)
+        bool deleteSession,
+        double xpMultiplier = 1.0)
     {
+        if (!double.IsFinite(xpMultiplier) || xpMultiplier <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(xpMultiplier),
+                "Voice XP multiplier must be greater than 0.");
+        }
+
         await _gate.WaitAsync();
         try
         {
@@ -825,6 +833,8 @@ public sealed class BotDatabase
                 {
                     xp += RandomNumberGenerator.GetInt32(minXpPerBlock, maxXpPerBlock + 1);
                 }
+
+                xp = ApplyXpMultiplier(xp, xpMultiplier);
 
                 movement = await ApplyInternalXpAsync(
                     connection,
@@ -875,6 +885,18 @@ public sealed class BotDatabase
         {
             _gate.Release();
         }
+    }
+
+    private static int ApplyXpMultiplier(int xp, double xpMultiplier)
+    {
+        if (xp <= 0)
+        {
+            return 0;
+        }
+
+        return Math.Max(
+            0,
+            (int)Math.Round(xp * xpMultiplier, MidpointRounding.AwayFromZero));
     }
 
     public async Task<int> GetInviteLedgerEntryCountAsync(ulong guildId)

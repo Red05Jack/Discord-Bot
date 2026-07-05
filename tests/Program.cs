@@ -425,6 +425,25 @@ try
         synchronizedVoiceReward is { Minutes: 5, Xp: 5 },
         "Die Voice-Synchronisierung hat eine bestehende Sitzung fälschlich zurückgesetzt.");
 
+    const ulong multipliedVoiceUserId = 403;
+    await database.StartVoiceSessionAsync(
+        guildId,
+        multipliedVoiceUserId,
+        503,
+        now);
+    var multipliedVoiceReward = await database.RewardVoiceTimeAsync(
+        guildId,
+        multipliedVoiceUserId,
+        now.AddMinutes(5),
+        minXpPerBlock: 10,
+        maxXpPerBlock: 10,
+        rewardBlockMinutes: 5,
+        deleteSession: true,
+        xpMultiplier: 1.25);
+    Assert(
+        multipliedVoiceReward is { Minutes: 5, Xp: 13 },
+        "Der Voice-XP-Multiplikator wurde nicht korrekt angewendet.");
+
     const ulong recoveredVoiceUserId = 402;
     Assert(
         await database.EnsureVoiceSessionAsync(
